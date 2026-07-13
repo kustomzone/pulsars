@@ -6,10 +6,12 @@
 //! 0) or sigmoid-router MoE (shared expert + streamed routed experts)] ->
 //! final norm -> lm head.
 //!
-//! Expert streaming here is v1: blocking pread of the selected experts'
-//! slabs each layer, uploaded into a fixed device arena and handed to the
-//! MoE kernels as explicit per-slot pointers. The StreamingStore (cache +
-//! prefetch) replaces the fetch path later without touching the graph.
+//! Expert streaming: three tiers per layer step. A VRAM hot-set cache
+//! (touch-count admission, so it never thrashes even though one token's
+//! working set exceeds the pool), then an LFU host cache, then io_uring
+//! batch reads whose completions overlap the H2D uploads. The MoE kernels
+//! always receive explicit per-slot device pointers, wherever the bytes
+//! ended up.
 
 #[cfg(target_os = "linux")]
 mod real {
@@ -531,7 +533,7 @@ mod real {
                     std::env::var("PULSAR_DEV_CACHE_GB")
                         .ok()
                         .and_then(|v| v.parse::<usize>().ok())
-                        .unwrap_or(3)
+                        .unwrap_or(4)
                         << 30,
                     max_slab,
                 )?,

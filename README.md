@@ -47,13 +47,20 @@ attribution.
    the C engine's in-decode effective feed measures 2.5-2.9 GB/s, so
    ~2 GB/s is currently lost to engine-side serialization - that gap is
    pulsar's headroom.
-3. Single-GPU Hy3 decode parity on the 4060 Ti via FFI kernels.
-   (in progress) The toolchain brick is proven: `crates/kernels` builds
-   the ds4-derived GQA kernels with nvcc from build.rs, and the kernel
-   self-test (4 phases vs a CPU reference, multi-chunk online softmax
-   included) passes when invoked through Rust FFI on the 4060 Ti
-   (`cargo test -p kernels -- --ignored`). Remaining: MoE/matmul kernels,
-   the streaming cache in Rust, and the hy-v3 forward graph.
+3. Single-GPU Hy3 decode parity on the 4060 Ti via FFI kernels. (done)
+   Full hy-v3 forward graph in `crates/engine` over the ds4-lineage
+   kernel set (GQA attention, dp4a q8_0 matmul with activation prequant,
+   q8_K integer expert dots, sigmoid router) plus a from-gguf BPE
+   tokenizer with ds4 gold-vector tests. Parity gate: teacher-forced
+   along ds4's greedy path, 15/16 per-position argmax agreement - the
+   one miss sits at ds4's 0.086-logit top1/top2 tie, and pulsar agrees
+   at ds4's 0.013 and 0.002 ties. Decode: 2.01 tok/s streaming
+   (three-tier expert path: VRAM hot-set cache with touch-count
+   admission, LFU host cache, io_uring reads overlapping H2D uploads)
+   vs ds4's 0.64-0.70 on the same box. Remaining niceties tracked
+   separately: batched prefill, cross-layer prefetch.
+   Decode-vs-prefill consistency holds by construction for now: prefill
+   runs the same single-token forward as decode.
 4. Multi-GPU expert residency on 2x RTX 5060 Ti (the reason this engine
    exists: ~48GB VRAM of resident experts, PCIe P2P where unlockable).
 5. Own quantizer: BF16 -> uniform-slab expert quants without llama.cpp.
