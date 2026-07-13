@@ -28,6 +28,7 @@ fn run() -> engine::Result {
     let mut n_predict = 16usize;
     let mut ctx = 2048u32;
     let mut bos = true;
+    let mut dump_logits = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -39,6 +40,7 @@ fn run() -> engine::Result {
             "-n" => n_predict = need("-n")?.parse()?,
             "--ctx" => ctx = need("--ctx")?.parse()?,
             "--no-bos" => bos = false,
+            "--dump-logits" => dump_logits = Some(need("--dump-logits")?),
             other => return Err(format!("unknown arg {other}").into()),
         }
     }
@@ -85,6 +87,22 @@ fn run() -> engine::Result {
         prompt_ids.len(),
         t1.elapsed().as_secs_f32()
     );
+
+    if let Some(path) = dump_logits {
+        let l = logits.as_ref().ok_or("no logits")?;
+        let mut s = String::with_capacity(l.len() * 12);
+        s.push('[');
+        for (i, v) in l.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!("{v}"));
+        }
+        s.push(']');
+        std::fs::write(&path, s)?;
+        eprintln!("pulsar: wrote {} logits to {path}", l.len());
+        return Ok(());
+    }
 
     let mut pos = prompt_ids.len() as u32;
     let mut generated = Vec::new();
