@@ -1618,3 +1618,258 @@ extern "C" int pulsar_gqa_attention(
 }
 
 extern "C" int pulsar_gqa_selftest(void) { return ds4_gpu_gqa_selftest(); }
+
+#include "mla_kernels.inc"
+
+/* ---- MLA selftest: full compact-path chain vs a host reference --------- */
+
+static float mla_host_q8_dot(const uint8_t *row, const float *x, uint32_t n) {
+    float acc = 0.0f;
+    for (uint32_t b = 0; b < (n + 31u) / 32u; b++) {
+        uint16_t d16;
+        memcpy(&d16, row + (uint64_t)b * 34u, 2);
+        const float d = f16_to_f32_host(d16);
+        const int8_t *qs = (const int8_t *)(row + (uint64_t)b * 34u + 2u);
+        const uint32_t base = b * 32u;
+        const uint32_t count = n - base < 32u ? n - base : 32u;
+        for (uint32_t i = 0; i < count; i++) acc += d * (float)qs[i] * x[base + i];
+    }
+    return acc;
+}
+
+static void mla_host_yarn(float theta_extrap, float freq_scale, float c0,
+                          float c1, int i0, float ext, float mscale,
+                          float *c, float *s) {
+    const float interp = freq_scale * theta_extrap;
+    float theta = interp;
+    if (ext != 0.0f) {
+        const float y = ((float)(i0 / 2) - c0) / fmaxf(0.001f, c1 - c0);
+        const float ramp = (1.0f - fminf(1.0f, fmaxf(0.0f, y))) * ext;
+        theta = interp * (1.0f - ramp) + theta_extrap * ramp;
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    *c = cosf(theta) * mscale;
+    *s = sinf(theta) * mscale;
+}
+
+static void mla_host_corr(uint32_t n_dims, uint32_t n_ctx_orig, float fb,
+                          float bfast, float bslow, float *c0, float *c1) {
+    const float denom = 2.0f * logf(fb);
+    *c0 = fmaxf(0.0f, floorf((float)n_dims *
+            logf((float)n_ctx_orig / (bfast * 2.0f * (float)M_PI)) / denom));
+    *c1 = fminf((float)n_dims - 1.0f, ceilf((float)n_dims *
+            logf((float)n_ctx_orig / (bslow * 2.0f * (float)M_PI)) / denom));
+}
+
+static void mla_fill_q8(uint8_t *w, uint64_t rows, uint32_t cols) {
+    const uint64_t row_bytes = mla_q8_row_bytes(cols);
+    for (uint64_t r = 0; r < rows; r++) {
+        uint8_t *row = w + r * row_bytes;
+        for (uint32_t b = 0; b < (cols + 31u) / 32u; b++) {
+            uint16_t d = f32_to_f16_bits(fabsf(gqa_test_randf()) * 0.05f + 0.001f);
+            memcpy(row + (uint64_t)b * 34u, &d, 2);
+            int8_t *qs = (int8_t *)(row + (uint64_t)b * 34u + 2u);
+            for (int i = 0; i < 32; i++)
+                qs[i] = (int8_t)((int)test_randbyte() - 128);
+        }
+    }
+}
+
+static int mla_selftest_one(float freq_scale, float ext_factor,
+                            float beta_fast, float beta_slow,
+                            const char *name) {
+    const uint32_t n_head = 4, kv_lora = 64, qk_nope = 32, qk_rope = 8;
+    const uint32_t qk_dim = qk_nope + qk_rope, value_dim = 16;
+    const uint32_t kv_raw_dim = kv_lora + qk_rope;
+    const uint32_t cache_cap = 16, n_prefill = 3;
+    const uint32_t n_ctx_orig = 64;
+    const float freq_base = 10000.0f, attn_factor = 1.0f, eps = 1e-5f;
+    const float scale = 1.0f / sqrtf((float)qk_dim);
+
+    const uint64_t kb_row = mla_q8_row_bytes(qk_nope);
+    const uint64_t vb_row = mla_q8_row_bytes(kv_lora);
+    const uint64_t kb_bytes = (uint64_t)n_head * kv_lora * kb_row;
+    const uint64_t vb_bytes = (uint64_t)n_head * value_dim * vb_row;
+    const uint32_t n_tok = n_prefill + 1; /* prefill batch + one decode */
+
+    float *q = (float *)malloc((uint64_t)n_tok * n_head * qk_dim * 4);
+    float *kv_raw = (float *)malloc((uint64_t)n_tok * kv_raw_dim * 4);
+    float *w_norm = (float *)malloc(kv_lora * 4);
+    uint8_t *k_b = (uint8_t *)malloc(kb_bytes);
+    uint8_t *v_b = (uint8_t *)malloc(vb_bytes);
+    for (uint64_t i = 0; i < (uint64_t)n_tok * n_head * qk_dim; i++)
+        q[i] = gqa_test_randf();
+    for (uint64_t i = 0; i < (uint64_t)n_tok * kv_raw_dim; i++)
+        kv_raw[i] = gqa_test_randf();
+    for (uint32_t i = 0; i < kv_lora; i++) w_norm[i] = gqa_test_randf();
+    mla_fill_q8(k_b, (uint64_t)n_head * kv_lora, qk_nope);
+    mla_fill_q8(v_b, (uint64_t)n_head * value_dim, kv_lora);
+
+    /* ---- host reference over all n_tok positions ---- */
+    float *h_kv_lora = (float *)calloc((uint64_t)cache_cap * kv_lora, 4);
+    float *h_k_rope = (float *)calloc((uint64_t)cache_cap * qk_rope, 4);
+    float *h_q_roped = (float *)malloc((uint64_t)n_tok * n_head * qk_dim * 4);
+    float *h_heads = (float *)malloc((uint64_t)n_tok * n_head * value_dim * 4);
+    memcpy(h_q_roped, q, (uint64_t)n_tok * n_head * qk_dim * 4);
+    float corr0 = 0.0f, corr1 = 0.0f;
+    if (ext_factor != 0.0f)
+        mla_host_corr(qk_rope, n_ctx_orig, freq_base, beta_fast, beta_slow,
+                      &corr0, &corr1);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        const float *raw = kv_raw + (uint64_t)t * kv_raw_dim;
+        double sum = 0.0;
+        for (uint32_t i = 0; i < kv_lora; i++) sum += (double)raw[i] * raw[i];
+        const float inv = 1.0f / sqrtf((float)(sum / kv_lora) + eps);
+        for (uint32_t i = 0; i < kv_lora; i++)
+            h_kv_lora[(uint64_t)t * kv_lora + i] = raw[i] * inv * w_norm[i];
+        for (uint32_t i = 0; i < qk_rope; i++)
+            h_k_rope[(uint64_t)t * qk_rope + i] = raw[kv_lora + i];
+        for (uint32_t h = 0; h < n_head; h++) {
+            float *row = h_q_roped + ((uint64_t)t * n_head + h) * qk_dim + qk_nope;
+            for (uint32_t i = 0; i < qk_rope; i += 2) {
+                const float theta = (float)t *
+                    powf(freq_base, -((float)i) / (float)qk_rope);
+                float c, s;
+                mla_host_yarn(theta, freq_scale, corr0, corr1, (int)i,
+                              ext_factor, attn_factor, &c, &s);
+                const float x0 = row[i], x1 = row[i + 1];
+                row[i] = x0 * c - x1 * s;
+                row[i + 1] = x0 * s + x1 * c;
+            }
+        }
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *qh = h_q_roped + ((uint64_t)t * n_head + h) * qk_dim;
+            float low[64];
+            for (uint32_t j = 0; j < kv_lora; j++)
+                low[j] = mla_host_q8_dot(
+                        k_b + ((uint64_t)h * kv_lora + j) * kb_row, qh, qk_nope);
+            float sc[16];
+            float maxs = -INFINITY;
+            for (uint32_t r = 0; r <= t; r++) {
+                float dotv = 0.0f;
+                for (uint32_t j = 0; j < kv_lora; j++)
+                    dotv += low[j] * h_kv_lora[(uint64_t)r * kv_lora + j];
+                for (uint32_t i = 0; i < qk_rope; i += 2) {
+                    const float theta = (float)r *
+                        powf(freq_base, -((float)i) / (float)qk_rope);
+                    float c, s;
+                    mla_host_yarn(theta, freq_scale, corr0, corr1, (int)i,
+                                  ext_factor, attn_factor, &c, &s);
+                    const float x0 = h_k_rope[(uint64_t)r * qk_rope + i];
+                    const float x1 = h_k_rope[(uint64_t)r * qk_rope + i + 1];
+                    dotv += qh[qk_nope + i] * (x0 * c - x1 * s) +
+                            qh[qk_nope + i + 1] * (x0 * s + x1 * c);
+                }
+                sc[r] = dotv * scale;
+                maxs = fmaxf(maxs, sc[r]);
+            }
+            float denom = 0.0f;
+            for (uint32_t r = 0; r <= t; r++) {
+                sc[r] = expf(sc[r] - maxs);
+                denom += sc[r];
+            }
+            denom = fmaxf(denom, 1.0e-20f);
+            float lora_sum[64];
+            for (uint32_t j = 0; j < kv_lora; j++) {
+                float acc = 0.0f;
+                for (uint32_t r = 0; r <= t; r++)
+                    acc += sc[r] * h_kv_lora[(uint64_t)r * kv_lora + j];
+                lora_sum[j] = acc / denom;
+            }
+            float *out = h_heads + ((uint64_t)t * n_head + h) * value_dim;
+            for (uint32_t d = 0; d < value_dim; d++)
+                out[d] = mla_host_q8_dot(
+                        v_b + ((uint64_t)h * value_dim + d) * vb_row,
+                        lora_sum, kv_lora);
+        }
+    }
+
+    /* ---- GPU: prefill batch of n_prefill, then one decode token ---- */
+    void *q_d = NULL, *kvr_d = NULL, *wn_d = NULL, *kb_d = NULL, *vb_d = NULL;
+    void *kvn_d = NULL, *lora_d = NULL, *rope_d = NULL, *sel_d = NULL;
+    void *low_d = NULL, *heads_d = NULL;
+    float *gpu_heads = (float *)malloc((uint64_t)n_tok * n_head * value_dim * 4);
+    int ok = cuda_ok(cudaMalloc(&q_d, (uint64_t)n_tok * n_head * qk_dim * 4), "q") &&
+             cuda_ok(cudaMalloc(&kvr_d, (uint64_t)n_tok * kv_raw_dim * 4), "kvr") &&
+             cuda_ok(cudaMalloc(&wn_d, kv_lora * 4), "wn") &&
+             cuda_ok(cudaMalloc(&kb_d, kb_bytes), "kb") &&
+             cuda_ok(cudaMalloc(&vb_d, vb_bytes), "vb") &&
+             cuda_ok(cudaMalloc(&kvn_d, (uint64_t)n_tok * kv_lora * 4), "kvn") &&
+             cuda_ok(cudaMalloc(&lora_d, (uint64_t)cache_cap * kv_lora * 4), "lora") &&
+             cuda_ok(cudaMalloc(&rope_d, (uint64_t)cache_cap * qk_rope * 4), "rope") &&
+             cuda_ok(cudaMalloc(&sel_d, (uint64_t)n_tok * cache_cap * 4), "sel") &&
+             cuda_ok(cudaMalloc(&low_d, (uint64_t)n_tok * n_head * kv_lora * 4), "low") &&
+             cuda_ok(cudaMalloc(&heads_d, (uint64_t)n_tok * n_head * value_dim * 4), "heads") &&
+             cuda_ok(cudaMemcpy(q_d, q, (uint64_t)n_tok * n_head * qk_dim * 4, cudaMemcpyHostToDevice), "q h2d") &&
+             cuda_ok(cudaMemcpy(kvr_d, kv_raw, (uint64_t)n_tok * kv_raw_dim * 4, cudaMemcpyHostToDevice), "kvr h2d") &&
+             cuda_ok(cudaMemcpy(wn_d, w_norm, kv_lora * 4, cudaMemcpyHostToDevice), "wn h2d") &&
+             cuda_ok(cudaMemcpy(kb_d, k_b, kb_bytes, cudaMemcpyHostToDevice), "kb h2d") &&
+             cuda_ok(cudaMemcpy(vb_d, v_b, vb_bytes, cudaMemcpyHostToDevice), "vb h2d");
+
+    const struct { uint32_t pos0, n; } phase[2] = {
+        {0, n_prefill}, {n_prefill, 1},
+    };
+    for (int p = 0; ok && p < 2; p++) {
+        const uint32_t pos0 = phase[p].pos0, n = phase[p].n;
+        const uint32_t n_selected = pos0 + n;
+        float *qp = (float *)q_d + (uint64_t)pos0 * n_head * qk_dim;
+        float *kvp = (float *)kvr_d + (uint64_t)pos0 * kv_raw_dim;
+        float *kvnp = (float *)kvn_d + (uint64_t)pos0 * kv_lora;
+        float *lowp = (float *)low_d + (uint64_t)pos0 * n_head * kv_lora;
+        float *headsp = (float *)heads_d + (uint64_t)pos0 * n_head * value_dim;
+        ok = pulsar_mla_rope_tail(qp, n, n_head, qk_dim, qk_rope, pos0,
+                                  n_ctx_orig, freq_base, freq_scale,
+                                  ext_factor, attn_factor, beta_fast, beta_slow) &&
+             pulsar_mla_kv_lora_rms_norm(kvnp, kvp, wn_d, n, kv_raw_dim,
+                                         kv_lora, eps) &&
+             pulsar_mla_store_compact_kv(lora_d, rope_d, kvnp, kvp, pos0, n,
+                                         cache_cap, kv_raw_dim, kv_lora, qk_rope) &&
+             pulsar_mla_fill_selected_range(sel_d, n, pos0, n_selected,
+                                            cache_cap) &&
+             pulsar_mla_qk_lowrank(lowp, qp, kb_d, n, n_head, kv_lora,
+                                   qk_nope, qk_dim) &&
+             pulsar_mla_attention(headsp, qp, lowp, lora_d, rope_d, vb_d,
+                                  sel_d, n, n_selected, cache_cap, n_head,
+                                  kv_lora, qk_nope, qk_rope, value_dim,
+                                  n_ctx_orig, freq_base, freq_scale,
+                                  ext_factor, attn_factor, beta_fast,
+                                  beta_slow);
+    }
+    ok = ok && cuda_ok(cudaDeviceSynchronize(), "sync") &&
+         cuda_ok(cudaMemcpy(gpu_heads, heads_d,
+                            (uint64_t)n_tok * n_head * value_dim * 4,
+                            cudaMemcpyDeviceToHost), "heads d2h");
+
+    float maxd = 0.0f, maxref = 0.0f;
+    if (ok) {
+        for (uint64_t i = 0; i < (uint64_t)n_tok * n_head * value_dim; i++) {
+            maxd = fmaxf(maxd, fabsf(gpu_heads[i] - h_heads[i]));
+            maxref = fmaxf(maxref, fabsf(h_heads[i]));
+        }
+        ok = maxd <= 2e-3f * fmaxf(maxref, 1.0f);
+    }
+    fprintf(stderr, "mla-selftest %s: %s (max diff %.2e, max |ref| %.2e)\n",
+            name, ok ? "PASS" : "FAIL", (double)maxd, (double)maxref);
+    if (q_d) cudaFree(q_d);
+    if (kvr_d) cudaFree(kvr_d);
+    if (wn_d) cudaFree(wn_d);
+    if (kb_d) cudaFree(kb_d);
+    if (vb_d) cudaFree(vb_d);
+    if (kvn_d) cudaFree(kvn_d);
+    if (lora_d) cudaFree(lora_d);
+    if (rope_d) cudaFree(rope_d);
+    if (sel_d) cudaFree(sel_d);
+    if (low_d) cudaFree(low_d);
+    if (heads_d) cudaFree(heads_d);
+    free(q); free(kv_raw); free(w_norm); free(k_b); free(v_b);
+    free(h_kv_lora); free(h_k_rope); free(h_q_roped); free(h_heads);
+    free(gpu_heads);
+    return ok;
+}
+
+extern "C" int pulsar_mla_selftest(void) {
+    /* plain rope (GLM-5.2's live config) and a yarn config to exercise
+     * the correction path */
+    return mla_selftest_one(1.0f, 0.0f, 0.0f, 0.0f, "plain") &&
+           mla_selftest_one(0.5f, 1.0f, 32.0f, 1.0f, "yarn");
+}

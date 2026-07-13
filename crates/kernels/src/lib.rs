@@ -70,6 +70,27 @@ mod real {
         fn pulsar_router_selftest() -> i32;
         fn pulsar_moe_selftest() -> i32;
         fn pulsar_glue_selftest() -> i32;
+        fn pulsar_mla_selftest() -> i32;
+
+        fn pulsar_mla_rope_tail(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, n_ctx_orig: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32) -> i32;
+        fn pulsar_mla_kv_lora_rms_norm(out: *mut c_void, kv_raw: *const c_void, w: *const c_void, n_tok: u32, kv_raw_dim: u32, kv_lora_dim: u32, eps: f32) -> i32;
+        fn pulsar_mla_store_compact_kv(kv_lora_cache: *mut c_void, k_rope_cache: *mut c_void, kv_norm: *const c_void, kv_raw: *const c_void, pos0: u32, n_tok: u32, cache_cap: u32, kv_raw_dim: u32, kv_lora_dim: u32, qk_rope: u32) -> i32;
+        fn pulsar_mla_fill_selected_range(selected: *mut c_void, n_tok: u32, pos0: u32, n_selected: u32, pad_row: u32) -> i32;
+        fn pulsar_mla_qk_lowrank(qk_low: *mut c_void, q: *const c_void, k_b: *const c_void, n_tok: u32, n_head: u32, kv_lora_dim: u32, qk_nope: u32, qk_dim: u32) -> i32;
+        fn pulsar_mla_attention(heads: *mut c_void, q: *const c_void, qk_low: *const c_void, kv_lora_cache: *const c_void, k_rope_cache: *const c_void, v_b: *const c_void, selected: *const c_void, n_tok: u32, n_selected: u32, cache_cap: u32, n_head: u32, kv_lora_dim: u32, qk_nope: u32, qk_rope: u32, value_dim: u32, n_ctx_orig: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32) -> i32;
+    }
+
+    /// RoPE/YaRN configuration for the MLA family. GLM-5.2 ships
+    /// ext_factor 0 (yarn off) but the parameters ride along.
+    #[derive(Debug, Clone, Copy)]
+    pub struct RopeCfg {
+        pub n_ctx_orig: u32,
+        pub freq_base: f32,
+        pub freq_scale: f32,
+        pub ext_factor: f32,
+        pub attn_factor: f32,
+        pub beta_fast: f32,
+        pub beta_slow: f32,
     }
 
     fn check(ret: i32, op: &'static str) -> Result {
@@ -318,6 +339,65 @@ mod real {
     pub fn glue_selftest() -> bool {
         unsafe { pulsar_glue_selftest() != 0 }
     }
+
+    pub fn mla_selftest() -> bool {
+        unsafe { pulsar_mla_selftest() != 0 }
+    }
+
+    pub fn mla_rope_tail(x: &mut DeviceBuf, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, r: &RopeCfg) -> Result {
+        check(
+            unsafe {
+                pulsar_mla_rope_tail(x.ptr_mut(), n_tok, n_head, head_dim, rot_dim, pos0, r.n_ctx_orig, r.freq_base, r.freq_scale, r.ext_factor, r.attn_factor, r.beta_fast, r.beta_slow)
+            },
+            "mla_rope_tail",
+        )
+    }
+
+    pub fn mla_kv_lora_rms_norm(out: &mut DeviceBuf, kv_raw: &DeviceBuf, w: &DeviceBuf, n_tok: u32, kv_raw_dim: u32, kv_lora_dim: u32, eps: f32) -> Result {
+        check(
+            unsafe {
+                pulsar_mla_kv_lora_rms_norm(out.ptr_mut(), kv_raw.ptr(), w.ptr(), n_tok, kv_raw_dim, kv_lora_dim, eps)
+            },
+            "mla_kv_lora_rms_norm",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn mla_store_compact_kv(kv_lora_cache: &mut DeviceBuf, k_rope_cache: &mut DeviceBuf, kv_norm: &DeviceBuf, kv_raw: &DeviceBuf, pos0: u32, n_tok: u32, cache_cap: u32, kv_raw_dim: u32, kv_lora_dim: u32, qk_rope: u32) -> Result {
+        check(
+            unsafe {
+                pulsar_mla_store_compact_kv(kv_lora_cache.ptr_mut(), k_rope_cache.ptr_mut(), kv_norm.ptr(), kv_raw.ptr(), pos0, n_tok, cache_cap, kv_raw_dim, kv_lora_dim, qk_rope)
+            },
+            "mla_store_compact_kv",
+        )
+    }
+
+    pub fn mla_fill_selected_range(selected: &mut DeviceBuf, n_tok: u32, pos0: u32, n_selected: u32, pad_row: u32) -> Result {
+        check(
+            unsafe { pulsar_mla_fill_selected_range(selected.ptr_mut(), n_tok, pos0, n_selected, pad_row) },
+            "mla_fill_selected_range",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn mla_qk_lowrank(qk_low: &mut DeviceBuf, q: &DeviceBuf, k_b: &DeviceBuf, n_tok: u32, n_head: u32, kv_lora_dim: u32, qk_nope: u32, qk_dim: u32) -> Result {
+        check(
+            unsafe {
+                pulsar_mla_qk_lowrank(qk_low.ptr_mut(), q.ptr(), k_b.ptr(), n_tok, n_head, kv_lora_dim, qk_nope, qk_dim)
+            },
+            "mla_qk_lowrank",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn mla_attention(heads: &mut DeviceBuf, q: &DeviceBuf, qk_low: &DeviceBuf, kv_lora_cache: &DeviceBuf, k_rope_cache: &DeviceBuf, v_b: &DeviceBuf, selected: &DeviceBuf, n_tok: u32, n_selected: u32, cache_cap: u32, n_head: u32, kv_lora_dim: u32, qk_nope: u32, qk_rope: u32, value_dim: u32, r: &RopeCfg) -> Result {
+        check(
+            unsafe {
+                pulsar_mla_attention(heads.ptr_mut(), q.ptr(), qk_low.ptr(), kv_lora_cache.ptr(), k_rope_cache.ptr(), v_b.ptr(), selected.ptr(), n_tok, n_selected, cache_cap, n_head, kv_lora_dim, qk_nope, qk_rope, value_dim, r.n_ctx_orig, r.freq_base, r.freq_scale, r.ext_factor, r.attn_factor, r.beta_fast, r.beta_slow)
+            },
+            "mla_attention",
+        )
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -355,6 +435,12 @@ mod tests {
     #[ignore = "requires a CUDA device"]
     fn glue_kernels_match_cpu_reference() {
         assert!(super::glue_selftest());
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn mla_kernels_match_cpu_reference() {
+        assert!(super::mla_selftest());
     }
 
     /// End-to-end DeviceBuf + rust-side wrapper smoke test: y = a + b.
