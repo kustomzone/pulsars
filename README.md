@@ -1,4 +1,4 @@
-# pulsar
+# Pulsar
 
 ![pulsar](docs/assets/pulsar-poster.png)
 
