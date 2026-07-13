@@ -470,7 +470,9 @@ mod real {
     /// expert staging arena, and reusable host staging.
     pub struct State {
         ctx: u32,
+        max_batch: u32,
         tok: DeviceBuf,
+        last_row: DeviceBuf,
         cur: DeviceBuf,
         normed: DeviceBuf,
         q: DeviceBuf,
@@ -507,6 +509,10 @@ mod real {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(12);
             Self::with_cache(m, ctx, gb << 30)
+        }
+
+        pub fn max_batch(&self) -> u32 {
+            self.max_batch
         }
 
         /// Persist the slab popularity census so the next run starts warm.
@@ -599,44 +605,61 @@ mod real {
                 vcache.push(DeviceBuf::alloc(kv_bytes)?);
             }
 
+            // batch prefill: activations sized for max_batch tokens; the
+            // logits/lm-head path stays single-row (last token only)
+            // big default: each prefill chunk costs roughly one pass over
+            // the expert corpus regardless of chunk size, so fewer chunks
+            // win; activations at 512 cost only ~150MB
+            let mb = std::env::var("PULSAR_BATCH")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(256)
+                .max(1);
             let mut st = State {
                 ctx,
-                tok: DeviceBuf::alloc(4)?,
-                cur: f32s(s.n_embd)?,
-                normed: f32s(s.n_embd)?,
-                q: f32s(s.n_head * s.head_dim)?,
-                k: f32s(s.n_head_kv * s.head_dim)?,
-                v: f32s(s.n_head_kv * s.head_dim)?,
-                heads: f32s(s.n_head * s.head_dim)?,
-                attn_out: f32s(s.n_embd)?,
-                after_attn: f32s(s.n_embd)?,
-                gate_act: f32s(s.n_ff_dense.max(s.n_ff_exp))?,
-                up_act: f32s(s.n_ff_dense.max(s.n_ff_exp))?,
-                ffn_mid: f32s(s.n_ff_dense.max(s.n_ff_exp))?,
-                ffn_out: f32s(s.n_embd)?,
-                shared_out: f32s(s.n_embd)?,
-                router_logits: f32s(s.n_expert)?,
-                router_selected: DeviceBuf::alloc(n_used * 4)?,
-                router_weights: f32s(s.n_expert_used)?,
-                moe_mid: f32s(s.n_expert_used * s.n_ff_exp)?,
-                moe_out: f32s(s.n_embd)?,
+                max_batch: mb,
+                tok: DeviceBuf::alloc(mb as usize * 4)?,
+                last_row: f32s(s.n_embd)?,
+                cur: f32s(mb * s.n_embd)?,
+                normed: f32s(mb * s.n_embd)?,
+                q: f32s(mb * s.n_head * s.head_dim)?,
+                k: f32s(mb * s.n_head_kv * s.head_dim)?,
+                v: f32s(mb * s.n_head_kv * s.head_dim)?,
+                heads: f32s(mb * s.n_head * s.head_dim)?,
+                attn_out: f32s(mb * s.n_embd)?,
+                after_attn: f32s(mb * s.n_embd)?,
+                gate_act: f32s(mb * s.n_ff_dense.max(s.n_ff_exp))?,
+                up_act: f32s(mb * s.n_ff_dense.max(s.n_ff_exp))?,
+                ffn_mid: f32s(mb * s.n_ff_dense.max(s.n_ff_exp))?,
+                ffn_out: f32s(mb * s.n_embd)?,
+                shared_out: f32s(mb * s.n_embd)?,
+                router_logits: f32s(mb * s.n_expert)?,
+                router_selected: DeviceBuf::alloc(mb as usize * n_used * 4)?,
+                router_weights: f32s(mb * s.n_expert_used)?,
+                moe_mid: f32s(mb * s.n_expert_used * s.n_ff_exp)?,
+                moe_out: f32s(mb * s.n_embd)?,
                 xq: DeviceBuf::alloc(
-                    s.n_embd as usize / kernels::Q8_K_BLOCK_ELEMS * kernels::Q8_K_BLOCK_BYTES,
+                    mb as usize * s.n_embd as usize / kernels::Q8_K_BLOCK_ELEMS
+                        * kernels::Q8_K_BLOCK_BYTES,
                 )?,
                 midq: DeviceBuf::alloc(
-                    n_used * s.n_ff_exp as usize / kernels::Q8_K_BLOCK_ELEMS
+                    mb as usize * n_used * s.n_ff_exp as usize / kernels::Q8_K_BLOCK_ELEMS
                         * kernels::Q8_K_BLOCK_BYTES,
                 )?,
                 dev_cache: DeviceSlabCache::new(
                     std::env::var("PULSAR_DEV_CACHE_GB")
                         .ok()
                         .and_then(|v| v.parse::<usize>().ok())
-                        .unwrap_or(4)
+                        .unwrap_or(3)
                         << 30,
                     max_slab,
                 )?,
+                // grow-only: decode stages <=n_used*3 slabs; a batched
+                // prefill union (up to n_expert*3) grows it on first use
                 staging: DeviceBuf::alloc(n_used * 3 * max_slab)?,
-                expert_ptrs: DeviceBuf::alloc(n_used * std::mem::size_of::<ExpertPtrs>())?,
+                expert_ptrs: DeviceBuf::alloc(
+                    mb as usize * n_used * std::mem::size_of::<ExpertPtrs>(),
+                )?,
                 kcache,
                 vcache,
                 logits: f32s(s.n_vocab)?,
@@ -664,42 +687,60 @@ mod real {
             pos: u32,
             want_logits: bool,
         ) -> Result<Option<Vec<f32>>> {
+            self.forward_batch(st, &[token], pos, want_logits)
+        }
+
+        /// Forward `tokens` at absolute positions pos0..pos0+n. Union
+        /// expert fetch per layer across the whole batch. Logits (when
+        /// requested) are for the LAST token only.
+        pub fn forward_batch(
+            &self,
+            st: &mut State,
+            tokens: &[u32],
+            pos0: u32,
+            want_logits: bool,
+        ) -> Result<Option<Vec<f32>>> {
             let s = self.shape;
-            if pos >= st.ctx {
+            let n_tok = tokens.len() as u32;
+            if n_tok == 0 || n_tok > st.max_batch {
+                return Err(format!("batch {} outside 1..={}", n_tok, st.max_batch).into());
+            }
+            if pos0 + n_tok > st.ctx {
                 return Err("position exceeds context".into());
             }
             let eps = s.rms_eps;
-            st.tok.write(0, kernels::as_bytes(&[token as i32]))?;
-            kernels::embed_q8_0(&mut st.cur, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, 1)?;
+            let toks_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+            st.tok.write(0, kernels::as_bytes(&toks_i32))?;
+            kernels::embed_q8_0(&mut st.cur, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, n_tok)?;
 
             for (il, l) in self.layers.iter().enumerate() {
                 // attention
-                kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, 1, eps)?;
-                kernels::matmul_q8_0(&mut st.q, &l.attn_q, &st.normed, s.n_embd, s.n_head * s.head_dim, 1)?;
-                kernels::matmul_q8_0(&mut st.k, &l.attn_k, &st.normed, s.n_embd, s.n_head_kv * s.head_dim, 1)?;
-                kernels::matmul_q8_0(&mut st.v, &l.attn_v, &st.normed, s.n_embd, s.n_head_kv * s.head_dim, 1)?;
-                kernels::gqa_head_rms_norm(&mut st.q, &l.q_norm, s.n_head, s.head_dim, eps)?;
-                kernels::gqa_head_rms_norm(&mut st.k, &l.k_norm, s.n_head_kv, s.head_dim, eps)?;
-                kernels::gqa_rope(&mut st.q, 1, s.n_head, s.head_dim, pos, s.rope_freq_base)?;
-                kernels::gqa_rope(&mut st.k, 1, s.n_head_kv, s.head_dim, pos, s.rope_freq_base)?;
-                kernels::gqa_kv_append(&mut st.kcache[il], &st.k, 1, s.n_head_kv, s.head_dim, st.ctx, pos)?;
-                kernels::gqa_kv_append(&mut st.vcache[il], &st.v, 1, s.n_head_kv, s.head_dim, st.ctx, pos)?;
-                kernels::gqa_attention(&mut st.heads, &st.q, &st.kcache[il], &st.vcache[il], 1, s.n_head, s.n_head_kv, s.head_dim, st.ctx, pos)?;
-                kernels::matmul_q8_0(&mut st.attn_out, &l.attn_output, &st.heads, s.n_head * s.head_dim, s.n_embd, 1)?;
-                kernels::add(&mut st.after_attn, &st.cur, &st.attn_out, s.n_embd)?;
+                kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, n_tok, eps)?;
+                kernels::matmul_q8_0(&mut st.q, &l.attn_q, &st.normed, s.n_embd, s.n_head * s.head_dim, n_tok)?;
+                kernels::matmul_q8_0(&mut st.k, &l.attn_k, &st.normed, s.n_embd, s.n_head_kv * s.head_dim, n_tok)?;
+                kernels::matmul_q8_0(&mut st.v, &l.attn_v, &st.normed, s.n_embd, s.n_head_kv * s.head_dim, n_tok)?;
+                kernels::gqa_head_rms_norm(&mut st.q, &l.q_norm, n_tok * s.n_head, s.head_dim, eps)?;
+                kernels::gqa_head_rms_norm(&mut st.k, &l.k_norm, n_tok * s.n_head_kv, s.head_dim, eps)?;
+                kernels::gqa_rope(&mut st.q, n_tok, s.n_head, s.head_dim, pos0, s.rope_freq_base)?;
+                kernels::gqa_rope(&mut st.k, n_tok, s.n_head_kv, s.head_dim, pos0, s.rope_freq_base)?;
+                kernels::gqa_kv_append(&mut st.kcache[il], &st.k, n_tok, s.n_head_kv, s.head_dim, st.ctx, pos0)?;
+                kernels::gqa_kv_append(&mut st.vcache[il], &st.v, n_tok, s.n_head_kv, s.head_dim, st.ctx, pos0)?;
+                kernels::gqa_attention(&mut st.heads, &st.q, &st.kcache[il], &st.vcache[il], n_tok, s.n_head, s.n_head_kv, s.head_dim, st.ctx, pos0)?;
+                kernels::matmul_q8_0(&mut st.attn_out, &l.attn_output, &st.heads, s.n_head * s.head_dim, s.n_embd, n_tok)?;
+                kernels::add(&mut st.after_attn, &st.cur, &st.attn_out, n_tok * s.n_embd)?;
 
                 // ffn
-                kernels::rms_norm(&mut st.normed, &st.after_attn, &l.ffn_norm, s.n_embd, 1, eps)?;
+                kernels::rms_norm(&mut st.normed, &st.after_attn, &l.ffn_norm, s.n_embd, n_tok, eps)?;
                 match &l.ffn {
                     Ffn::Dense { gate, up, down } => {
-                        kernels::matmul_q8_0(&mut st.gate_act, gate, &st.normed, s.n_embd, s.n_ff_dense, 1)?;
-                        kernels::matmul_q8_0(&mut st.up_act, up, &st.normed, s.n_embd, s.n_ff_dense, 1)?;
-                        kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, s.n_ff_dense, 0.0, 1.0)?;
-                        kernels::matmul_q8_0(&mut st.ffn_out, down, &st.ffn_mid, s.n_ff_dense, s.n_embd, 1)?;
-                        kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, s.n_embd)?;
+                        kernels::matmul_q8_0(&mut st.gate_act, gate, &st.normed, s.n_embd, s.n_ff_dense, n_tok)?;
+                        kernels::matmul_q8_0(&mut st.up_act, up, &st.normed, s.n_embd, s.n_ff_dense, n_tok)?;
+                        kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, n_tok * s.n_ff_dense, 0.0, 1.0)?;
+                        kernels::matmul_q8_0(&mut st.ffn_out, down, &st.ffn_mid, s.n_ff_dense, s.n_embd, n_tok)?;
+                        kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, n_tok * s.n_embd)?;
                     }
                     Ffn::Moe { gate_inp, probs_b, shexp_gate, shexp_up, shexp_down, gate_exps, up_exps, down_exps } => {
-                        kernels::matmul_f32(&mut st.router_logits, gate_inp, &st.normed, s.n_embd, s.n_expert, 1)?;
+                        kernels::matmul_f32(&mut st.router_logits, gate_inp, &st.normed, s.n_embd, s.n_expert, n_tok)?;
                         kernels::router_select(
                             &mut st.router_selected,
                             &mut st.router_weights,
@@ -708,21 +749,28 @@ mod real {
                             s.n_expert,
                             s.n_expert_used,
                             s.expert_weight_scale,
-                            1,
+                            n_tok,
                         )?;
 
-                        // Expert resolve: VRAM cache first (no disk, no
-                        // H2D), then host LFU + one io_uring batch for
-                        // whatever is left.
+                        // Expert resolve, batched: the union of distinct
+                        // experts across all tokens fetches once. VRAM
+                        // cache first, then host LFU + one io_uring batch.
                         kernels::sync()?;
-                        let selected = st.router_selected.read_i32(s.n_expert_used as usize)?;
+                        let selected = st
+                            .router_selected
+                            .read_i32(n_tok as usize * s.n_expert_used as usize)?;
                         debug_assert_eq!(up_exps.expert_bytes, gate_exps.expert_bytes);
                         debug_assert_eq!(down_exps.expert_bytes, gate_exps.expert_bytes);
-                        let mut offsets = Vec::with_capacity(3 * s.n_expert_used as usize);
-                        for &e in &selected {
-                            if e < 0 || e as u32 >= s.n_expert {
-                                continue;
-                            }
+                        let mut distinct: Vec<i32> = selected
+                            .iter()
+                            .copied()
+                            .filter(|&e| e >= 0 && (e as u32) < s.n_expert)
+                            .collect();
+                        distinct.sort_unstable();
+                        distinct.dedup();
+                        let mut offsets =
+                            Vec::with_capacity(3 * distinct.len());
+                        for &e in &distinct {
                             for t in [gate_exps, up_exps, down_exps] {
                                 offsets.push(stream::Read {
                                     offset: t.abs_offset + e as u64 * t.expert_bytes,
@@ -742,6 +790,9 @@ mod real {
                             }
                         }
                         let slab = gate_exps.expert_bytes as usize;
+                        if wants.len() * slab > st.staging.bytes() {
+                            st.staging = DeviceBuf::alloc(wants.len() * slab)?;
+                        }
                         let mut staged = 0usize;
                         let dev_cache = &mut st.dev_cache;
                         let staging = &mut st.staging;
@@ -758,7 +809,7 @@ mod real {
                             resolved.insert(off, p);
                             Ok(())
                         })?;
-                        let mut ptrs = Vec::with_capacity(s.n_expert_used as usize);
+                        let mut ptrs = Vec::with_capacity(selected.len());
                         for &e in &selected {
                             if e < 0 || e as u32 >= s.n_expert {
                                 ptrs.push(ExpertPtrs::NULL);
@@ -776,27 +827,27 @@ mod real {
                         st.expert_ptrs.write(0, kernels::as_bytes(&ptrs))?;
 
                         // shared expert
-                        kernels::matmul_q8_0(&mut st.gate_act, shexp_gate, &st.normed, s.n_embd, s.n_ff_exp, 1)?;
-                        kernels::matmul_q8_0(&mut st.up_act, shexp_up, &st.normed, s.n_embd, s.n_ff_exp, 1)?;
-                        kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, s.n_ff_exp, 0.0, 1.0)?;
-                        kernels::matmul_q8_0(&mut st.shared_out, shexp_down, &st.ffn_mid, s.n_ff_exp, s.n_embd, 1)?;
+                        kernels::matmul_q8_0(&mut st.gate_act, shexp_gate, &st.normed, s.n_embd, s.n_ff_exp, n_tok)?;
+                        kernels::matmul_q8_0(&mut st.up_act, shexp_up, &st.normed, s.n_embd, s.n_ff_exp, n_tok)?;
+                        kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, n_tok * s.n_ff_exp, 0.0, 1.0)?;
+                        kernels::matmul_q8_0(&mut st.shared_out, shexp_down, &st.ffn_mid, s.n_ff_exp, s.n_embd, n_tok)?;
 
                         // routed experts: activations quantized to q8_K,
                         // integer dp4a dots (ds4's exact math)
-                        kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, 1)?;
+                        kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, n_tok)?;
                         kernels::moe_pair_swiglu(
                             &mut st.moe_mid, &st.expert_ptrs, &st.router_weights, &st.xq,
-                            s.n_embd, s.n_ff_exp, s.n_expert_used, 1, gate_exps.row_bytes, gate_exps.quant,
+                            s.n_embd, s.n_ff_exp, s.n_expert_used, n_tok, gate_exps.row_bytes, gate_exps.quant,
                         )?;
-                        kernels::quantize_q8_k(&mut st.midq, &st.moe_mid, s.n_ff_exp, s.n_expert_used)?;
+                        kernels::quantize_q8_k(&mut st.midq, &st.moe_mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
                         kernels::moe_down(
                             &mut st.moe_out, &st.expert_ptrs, &st.midq,
-                            s.n_ff_exp, s.n_embd, s.n_expert_used, 1, down_exps.row_bytes, down_exps.quant,
+                            s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
                         )?;
 
                         // cur = after_attn + routed + shared (ds4's add3)
-                        kernels::add(&mut st.ffn_out, &st.moe_out, &st.shared_out, s.n_embd)?;
-                        kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, s.n_embd)?;
+                        kernels::add(&mut st.ffn_out, &st.moe_out, &st.shared_out, n_tok * s.n_embd)?;
+                        kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, n_tok * s.n_embd)?;
                     }
                 }
             }
@@ -804,7 +855,9 @@ mod real {
             if !want_logits {
                 return Ok(None);
             }
-            kernels::rms_norm(&mut st.normed, &st.cur, &self.output_norm, s.n_embd, 1, eps)?;
+            let row = s.n_embd as usize * 4;
+            kernels::copy_d2d(&mut st.last_row, 0, &st.cur, (n_tok as usize - 1) * row, row)?;
+            kernels::rms_norm(&mut st.normed, &st.last_row, &self.output_norm, s.n_embd, 1, eps)?;
             kernels::matmul_q8_0(&mut st.logits, &self.output, &st.normed, s.n_embd, s.n_vocab, 1)?;
             kernels::sync()?;
             Ok(Some(st.logits.read_f32(s.n_vocab as usize)?))

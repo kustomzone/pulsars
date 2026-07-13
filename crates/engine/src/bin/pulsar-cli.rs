@@ -97,9 +97,11 @@ fn run() -> engine::Result {
 
     let t1 = std::time::Instant::now();
     let mut logits = None;
-    for (i, &id) in prompt_ids.iter().enumerate() {
-        let last = i + 1 == prompt_ids.len();
-        logits = model.forward_token(&mut st, id, i as u32, last)?;
+    let mut pos0 = 0u32;
+    for chunk in prompt_ids.chunks(st.max_batch() as usize) {
+        let last = pos0 as usize + chunk.len() == prompt_ids.len();
+        logits = model.forward_batch(&mut st, chunk, pos0, last)?;
+        pos0 += chunk.len() as u32;
     }
     eprintln!(
         "pulsar: prefill {} tokens in {:.2}s",

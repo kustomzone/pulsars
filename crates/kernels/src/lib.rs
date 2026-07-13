@@ -195,6 +195,24 @@ mod real {
         check_rt(unsafe { cudaDeviceSynchronize() }, "cudaDeviceSynchronize")
     }
 
+    const D2D: i32 = 3;
+
+    /// Device-to-device copy between buffers (byte offsets).
+    pub fn copy_d2d(dst: &mut DeviceBuf, dst_off: usize, src: &DeviceBuf, src_off: usize, bytes: usize) -> Result {
+        assert!(dst_off + bytes <= dst.bytes() && src_off + bytes <= src.bytes());
+        check_rt(
+            unsafe {
+                cudaMemcpy(
+                    (dst.ptr_mut() as *mut u8).add(dst_off) as *mut c_void,
+                    (src.ptr() as *const u8).add(src_off) as *const c_void,
+                    bytes,
+                    D2D,
+                )
+            },
+            "cudaMemcpy d2d",
+        )
+    }
+
     pub fn embed_q8_0(out: &mut DeviceBuf, w: &DeviceBuf, tokens: &DeviceBuf, n_embd: u32, n_vocab: u32, n_tok: u32) -> Result {
         check(unsafe { pulsar_embed_q8_0(out.ptr_mut(), w.ptr(), tokens.ptr(), n_embd, n_vocab, n_tok) }, "embed_q8_0")
     }
