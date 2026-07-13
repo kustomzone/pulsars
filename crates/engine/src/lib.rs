@@ -253,6 +253,34 @@ mod real {
         tick: u64,
     }
 
+    /// Decode-loop stage timers. `sync` is the blocking wait for the GPU
+    /// at the router readback (== all attention/router kernel time),
+    /// `resolve` the expert resolve wall time, of which `h2d` is spent in
+    /// uploads to the device.
+    #[derive(Default)]
+    pub struct Prof {
+        pub sync: std::time::Duration,
+        pub resolve: std::time::Duration,
+        pub h2d: std::time::Duration,
+        pub tail: std::time::Duration,
+        pub calls: u64,
+    }
+
+    impl Prof {
+        pub fn report(&self) -> String {
+            let s = |d: std::time::Duration| d.as_secs_f64();
+            format!(
+                "gpu-wait {:.2}s, resolve {:.2}s (h2d {:.2}s, disk/host {:.2}s), logits-tail {:.2}s over {} layer steps",
+                s(self.sync),
+                s(self.resolve),
+                s(self.h2d),
+                s(self.resolve) - s(self.h2d),
+                s(self.tail),
+                self.calls
+            )
+        }
+    }
+
     /// Cross-layer prefetcher: a background thread with its own io_uring
     /// fd fetches predicted next-layer expert slabs while the main thread
     /// resolves the current layer and the GPU computes. Slabs come back
@@ -265,7 +293,7 @@ mod real {
 
     impl Prefetcher {
         fn spawn(path: &Path) -> Result<Prefetcher> {
-            let mut fetcher = stream::fetch::Fetcher::open(path, 16)?;
+            let mut fetcher = stream::fetch::Fetcher::open_with(path, 16, fetch_buf_alloc())?;
             let (req_tx, req_rx) = std::sync::mpsc::channel::<Vec<stream::Read>>();
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
@@ -376,10 +404,23 @@ mod real {
         }
     }
 
+    /// Fetch buffers in CUDA pinned memory (H2D at full PCIe rate; they
+    /// live on as host-cache slabs, so cache-hit uploads benefit too).
+    /// PULSAR_NO_PINNED=1 reverts to pageable.
+    fn fetch_buf_alloc() -> Option<stream::uring::BufAlloc> {
+        if std::env::var_os("PULSAR_NO_PINNED").is_some() {
+            return None;
+        }
+        Some(stream::uring::BufAlloc {
+            alloc: kernels::pinned_alloc,
+            free: kernels::pinned_free,
+        })
+    }
+
     impl StreamingStore {
         fn open(path: &Path, budget: usize) -> Result<StreamingStore> {
             Ok(StreamingStore {
-                fetcher: stream::fetch::Fetcher::open(path, 32)?,
+                fetcher: stream::fetch::Fetcher::open_with(path, 32, fetch_buf_alloc())?,
                 cache: std::collections::HashMap::new(),
                 used: 0,
                 budget,
@@ -664,6 +705,8 @@ mod real {
         pred_logits: DeviceBuf,
         pred_selected: DeviceBuf,
         pred_weights: DeviceBuf,
+        /// Cumulative per-stage wall time (PULSAR_PROFILE=1 to print).
+        pub prof: Prof,
         // MLA scratch (dummies for Gqa)
         q_rank: DeviceBuf,
         q_rank_norm: DeviceBuf,
@@ -854,6 +897,7 @@ mod real {
                 pred_logits: f32s(s.n_expert)?,
                 pred_selected: DeviceBuf::alloc(n_used * 4)?,
                 pred_weights: f32s(s.n_expert_used)?,
+                prof: Prof::default(),
                 q_rank: f32s(mb * s.n_lora_q.max(1))?,
                 q_rank_norm: f32s(mb * s.n_lora_q.max(1))?,
                 kv_raw: f32s(mb * (s.n_kv_lora + s.qk_rope).max(1))?,
@@ -1000,10 +1044,24 @@ mod real {
                             )?;
                         }
 
+                        // shared expert: depends only on normed, so it is
+                        // launched BEFORE the resolve - the GPU computes it
+                        // under the disk/H2D wait
+                        kernels::matmul_q8_0(&mut st.gate_act, shexp_gate, &st.normed, s.n_embd, s.n_ff_exp, n_tok)?;
+                        kernels::matmul_q8_0(&mut st.up_act, shexp_up, &st.normed, s.n_embd, s.n_ff_exp, n_tok)?;
+                        kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, n_tok * s.n_ff_exp, 0.0, 1.0)?;
+                        kernels::matmul_q8_0(&mut st.shared_out, shexp_down, &st.ffn_mid, s.n_ff_exp, s.n_embd, n_tok)?;
+                        // also quantize the routed-expert activations now;
+                        // only the expert weights are still in flight
+                        kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, n_tok)?;
+
                         // Expert resolve, batched: the union of distinct
                         // experts across all tokens fetches once. VRAM
                         // cache first, then host LFU + one io_uring batch.
+                        let t_sync = std::time::Instant::now();
                         kernels::sync()?;
+                        st.prof.sync += t_sync.elapsed();
+                        let t_resolve = std::time::Instant::now();
                         let selected = st
                             .router_selected
                             .read_i32(n_tok as usize * s.n_expert_used as usize)?;
@@ -1068,7 +1126,9 @@ mod real {
                         let mut staged = 0usize;
                         let dev_cache = &mut st.dev_cache;
                         let staging = &mut st.staging;
+                        let mut h2d = std::time::Duration::ZERO;
                         st.store.ensure_with(&wants, |off, payload| {
+                            let t = std::time::Instant::now();
                             let p = match dev_cache.maybe_insert(off, payload, &in_use)? {
                                 Some(p) => p,
                                 None => {
@@ -1078,9 +1138,11 @@ mod real {
                                     staging.ptr_at(base)
                                 }
                             };
+                            h2d += t.elapsed();
                             resolved.insert(off, p);
                             Ok(())
                         })?;
+                        st.prof.h2d += h2d;
                         let mut ptrs = Vec::with_capacity(selected.len());
                         for &e in &selected {
                             if e < 0 || e as u32 >= s.n_expert {
@@ -1097,16 +1159,11 @@ mod real {
                             });
                         }
                         st.expert_ptrs.write(0, kernels::as_bytes(&ptrs))?;
-
-                        // shared expert
-                        kernels::matmul_q8_0(&mut st.gate_act, shexp_gate, &st.normed, s.n_embd, s.n_ff_exp, n_tok)?;
-                        kernels::matmul_q8_0(&mut st.up_act, shexp_up, &st.normed, s.n_embd, s.n_ff_exp, n_tok)?;
-                        kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, n_tok * s.n_ff_exp, 0.0, 1.0)?;
-                        kernels::matmul_q8_0(&mut st.shared_out, shexp_down, &st.ffn_mid, s.n_ff_exp, s.n_embd, n_tok)?;
+                        st.prof.resolve += t_resolve.elapsed();
+                        st.prof.calls += 1;
 
                         // routed experts: activations quantized to q8_K,
                         // integer dp4a dots (ds4's exact math)
-                        kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, n_tok)?;
                         kernels::moe_pair_swiglu(
                             &mut st.moe_mid, &st.expert_ptrs, &st.router_weights, &st.xq,
                             s.n_embd, s.n_ff_exp, s.n_expert_used, n_tok, gate_exps.row_bytes, gate_exps.quant,
@@ -1127,12 +1184,15 @@ mod real {
             if !want_logits {
                 return Ok(None);
             }
+            let t_tail = std::time::Instant::now();
             let row = s.n_embd as usize * 4;
             kernels::copy_d2d(&mut st.last_row, 0, &st.cur, (n_tok as usize - 1) * row, row)?;
             kernels::rms_norm(&mut st.normed, &st.last_row, &self.output_norm, s.n_embd, 1, eps)?;
             kernels::matmul_q8_0(&mut st.logits, &self.output, &st.normed, s.n_embd, s.n_vocab, 1)?;
             kernels::sync()?;
-            Ok(Some(st.logits.read_f32(s.n_vocab as usize)?))
+            let out = st.logits.read_f32(s.n_vocab as usize)?;
+            st.prof.tail += t_tail.elapsed();
+            Ok(Some(out))
         }
     }
 

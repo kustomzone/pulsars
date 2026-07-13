@@ -232,6 +232,46 @@ mod real {
         }
     }
 
+    /// Plain-function pinned allocator pair for injection into CUDA-free
+    /// crates (fetch buffers that later feed cudaMemcpy). cudaHostAlloc
+    /// costs milliseconds of page-pinning per call, so freed buffers are
+    /// recycled through a size-keyed pool: at steady state (cache evicting
+    /// as fast as it fills) no pinning syscalls happen at all. Returns
+    /// null on failure so callers fall back to pageable memory.
+    fn pinned_pool() -> &'static std::sync::Mutex<std::collections::HashMap<usize, Vec<usize>>> {
+        static POOL: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<usize, Vec<usize>>>,
+        > = std::sync::OnceLock::new();
+        POOL.get_or_init(Default::default)
+    }
+
+    pub fn pinned_alloc(bytes: usize) -> *mut u8 {
+        if let Some(ptr) = pinned_pool()
+            .lock()
+            .unwrap()
+            .get_mut(&bytes)
+            .and_then(Vec::pop)
+        {
+            return ptr as *mut u8;
+        }
+        let mut host = std::ptr::null_mut();
+        let rc = unsafe { cudaHostAlloc(&mut host, bytes.max(1), 0) };
+        if rc == 0 {
+            host as *mut u8
+        } else {
+            std::ptr::null_mut()
+        }
+    }
+
+    pub fn pinned_free(ptr: *mut u8, bytes: usize) {
+        pinned_pool()
+            .lock()
+            .unwrap()
+            .entry(bytes)
+            .or_default()
+            .push(ptr as usize);
+    }
+
     pub fn as_bytes<T: Copy>(v: &[T]) -> &[u8] {
         unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
     }

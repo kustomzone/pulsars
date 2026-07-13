@@ -330,6 +330,9 @@ fn run() -> engine::Result {
         pos += 1;
     }
     println!();
+    if std::env::var_os("PULSAR_PROFILE").is_some() {
+        eprintln!("pulsar: profile: {}", st.prof.report());
+    }
     st.save_warm(&model)?;
     let dt = t2.elapsed().as_secs_f32();
     eprintln!(

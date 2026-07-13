@@ -87,9 +87,18 @@ pub mod uring {
     use io_uring::{opcode, types, IoUring};
     use std::os::fd::AsRawFd;
 
+    /// Custom page-aligned allocator (e.g. CUDA pinned memory) injected by
+    /// the engine; the stream crate itself stays CUDA-free.
+    #[derive(Clone, Copy)]
+    pub struct BufAlloc {
+        pub alloc: fn(usize) -> *mut u8,
+        pub free: fn(*mut u8, usize),
+    }
+
     pub struct Aligned {
         ptr: *mut u8,
         cap: usize,
+        custom_free: Option<fn(*mut u8, usize)>,
     }
 
     unsafe impl Send for Aligned {}
@@ -109,15 +118,32 @@ pub mod uring {
             if ptr.is_null() {
                 return None;
             }
-            Some(Self { ptr, cap })
+            Some(Self { ptr, cap, custom_free: None })
+        }
+
+        /// Allocate via `a`, falling back to the default allocator when it
+        /// returns null (e.g. pinned memory exhausted).
+        pub fn new_with(cap: usize, align: usize, a: Option<BufAlloc>) -> Option<Self> {
+            if let Some(a) = a {
+                let ptr = (a.alloc)(cap);
+                if !ptr.is_null() {
+                    return Some(Self { ptr, cap, custom_free: Some(a.free) });
+                }
+            }
+            Self::new(cap, align)
         }
     }
 
     impl Drop for Aligned {
         fn drop(&mut self) {
-            let layout =
-                std::alloc::Layout::from_size_align(self.cap, 4096).unwrap();
-            unsafe { std::alloc::dealloc(self.ptr, layout) }
+            match self.custom_free {
+                Some(free) => free(self.ptr, self.cap),
+                None => {
+                    let layout =
+                        std::alloc::Layout::from_size_align(self.cap, 4096).unwrap();
+                    unsafe { std::alloc::dealloc(self.ptr, layout) }
+                }
+            }
         }
     }
 
@@ -254,15 +280,27 @@ pub mod fetch {
         ring: IoUring,
         file: std::fs::File,
         qd: usize,
+        buf_alloc: Option<super::uring::BufAlloc>,
     }
 
     impl Fetcher {
         pub fn open(path: &std::path::Path, qd: usize) -> std::io::Result<Fetcher> {
+            Self::open_with(path, qd, None)
+        }
+
+        /// `buf_alloc` supplies the fetch buffers (e.g. CUDA pinned memory
+        /// so later H2D copies run at full PCIe rate); buffers outlive the
+        /// fetch as cache slabs, so allocate accordingly.
+        pub fn open_with(
+            path: &std::path::Path,
+            qd: usize,
+            buf_alloc: Option<super::uring::BufAlloc>,
+        ) -> std::io::Result<Fetcher> {
             let file = std::fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_DIRECT)
                 .open(path)?;
-            Ok(Fetcher { ring: IoUring::new(qd as u32 * 2)?, file, qd })
+            Ok(Fetcher { ring: IoUring::new(qd as u32 * 2)?, file, qd, buf_alloc })
         }
 
         /// Fetch every read; result[i] corresponds to reads[i].
@@ -296,7 +334,7 @@ pub mod fetch {
                     let aligned_off = r.offset & !(ALIGN - 1);
                     let payload_off = (r.offset - aligned_off) as usize;
                     let disk_len = (payload_off as u64 + r.len).next_multiple_of(ALIGN);
-                    let buf = Aligned::new(disk_len as usize, ALIGN as usize)
+                    let buf = Aligned::new_with(disk_len as usize, ALIGN as usize, self.buf_alloc)
                         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::OutOfMemory))?;
                     let sqe = opcode::Read::new(fd, buf.ptr(), disk_len as u32)
                         .offset(aligned_off)
