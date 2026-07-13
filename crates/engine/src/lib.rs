@@ -284,6 +284,73 @@ mod real {
         }
     }
 
+    /// Ping-pong staging arena for one parity of MLA layers: layer N+1's
+    /// PINNED attn tensors are cudaMemcpyAsync'd here (2x the bandwidth of
+    /// zero-copy kernel reads, and overlapped under layer N's compute).
+    /// Best-effort: if the copy hasn't landed when the layer runs, kernels
+    /// fall back to the zero-copy pinned pointers - same bytes either way.
+    struct AttnStage {
+        q_a: DeviceBuf,
+        q_b: DeviceBuf,
+        kv_a: DeviceBuf,
+        k_b: DeviceBuf,
+        v_b: DeviceBuf,
+        attn_output: DeviceBuf,
+        stream: kernels::CopyStream,
+        layer: Option<usize>,
+    }
+
+    impl AttnStage {
+        fn new(l: &LayerW) -> Result<AttnStage> {
+            let Attn::Mla { q_a, q_b, kv_a_mqa, k_b, v_b, .. } = &l.attn else {
+                return Err("attn stage needs an Mla layer".into());
+            };
+            Ok(AttnStage {
+                q_a: DeviceBuf::alloc(q_a.bytes())?,
+                q_b: DeviceBuf::alloc(q_b.bytes())?,
+                kv_a: DeviceBuf::alloc(kv_a_mqa.bytes())?,
+                k_b: DeviceBuf::alloc(k_b.bytes())?,
+                v_b: DeviceBuf::alloc(v_b.bytes())?,
+                attn_output: DeviceBuf::alloc(l.attn_output.bytes())?,
+                stream: kernels::CopyStream::new()?,
+                layer: None,
+            })
+        }
+
+        /// Queue copies of `l`'s pinned attn tensors for layer `il`.
+        fn kick(&mut self, l: &LayerW, il: usize) -> Result {
+            let Attn::Mla { q_a, q_b, kv_a_mqa, k_b, v_b, .. } = &l.attn else {
+                return Ok(());
+            };
+            self.layer = None;
+            // arena may still be read by in-flight default-stream kernels
+            self.stream.gate_behind_default()?;
+            let mut any = false;
+            for (dst, src) in [
+                (&mut self.q_a, q_a),
+                (&mut self.q_b, q_b),
+                (&mut self.kv_a, kv_a_mqa),
+                (&mut self.k_b, k_b),
+                (&mut self.v_b, v_b),
+                (&mut self.attn_output, &l.attn_output),
+            ] {
+                if src.is_pinned() {
+                    self.stream.copy_from_pinned(dst, 0, src)?;
+                    any = true;
+                }
+            }
+            if any {
+                self.stream.record()?;
+                self.layer = Some(il);
+            }
+            Ok(())
+        }
+
+        fn ready_for(&self, il: usize) -> bool {
+            self.layer == Some(il) && self.stream.done()
+        }
+    }
+
     /// Cross-layer prefetcher: a background thread with its own io_uring
     /// fd fetches predicted next-layer expert slabs while the main thread
     /// resolves the current layer and the GPU computes. Slabs come back
@@ -615,7 +682,18 @@ mod real {
             let (file, gguf) = parse_header(path)?;
             let shape = Shape::from_gguf(&gguf)?;
 
-            let token_embd = upload(&file, &gguf, "token_embd.weight")?;
+            // the embedding table is read ~one row per token - pinned
+            // host is free for it and returns ~1GB of VRAM to hot weights
+            let token_embd = {
+                let bytes = read_tensor_bytes(&file, &gguf, "token_embd.weight")?;
+                let mut buf = if shape.family == Family::Mla {
+                    DeviceBuf::alloc_pinned(bytes.len())?
+                } else {
+                    DeviceBuf::alloc(bytes.len())?
+                };
+                buf.write(0, &bytes)?;
+                buf
+            };
             let output_norm = upload(&file, &gguf, "output_norm.weight")?;
             let output = upload(&file, &gguf, "output.weight")?;
 
@@ -629,7 +707,7 @@ mod real {
                     (std::env::var("PULSAR_ATTN_VRAM_GB")
                         .ok()
                         .and_then(|v| v.parse::<i64>().ok())
-                        .unwrap_or(5))
+                        .unwrap_or(6))
                         << 30
                 }
             };
@@ -747,6 +825,7 @@ mod real {
         pred_weights: DeviceBuf,
         /// Cumulative per-stage wall time (PULSAR_PROFILE=1 to print).
         pub prof: Prof,
+        stages: Option<[AttnStage; 2]>,
         // MLA scratch (dummies for Gqa)
         q_rank: DeviceBuf,
         q_rank_norm: DeviceBuf,
@@ -763,7 +842,7 @@ mod real {
             let gb = std::env::var("PULSAR_CACHE_GB")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(if m.shape.family == Family::Mla { 7 } else { 12 });
+                .unwrap_or(12);
             Self::with_cache(m, ctx, gb << 30)
         }
 
@@ -940,6 +1019,13 @@ mod real {
                 pred_selected: DeviceBuf::alloc(n_used * 4)?,
                 pred_weights: f32s(s.n_expert_used)?,
                 prof: Prof::default(),
+                stages: match s.family {
+                    Family::Mla => Some([
+                        AttnStage::new(&m.layers[0])?,
+                        AttnStage::new(&m.layers[0])?,
+                    ]),
+                    Family::Gqa => None,
+                },
                 q_rank: f32s(mb * s.n_lora_q.max(1))?,
                 q_rank_norm: f32s(mb * s.n_lora_q.max(1))?,
                 kv_raw: f32s(mb * (s.n_kv_lora + s.qk_rope).max(1))?,
@@ -996,8 +1082,18 @@ mod real {
             kernels::embed_q8_0(&mut st.cur, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, n_tok)?;
 
             for (il, l) in self.layers.iter().enumerate() {
+                // stage layer il+1's pinned attn tensors under this
+                // layer's compute (decode only: prefill amortizes weights
+                // over the whole batch already)
+                if n_tok == 1 {
+                    if let (Some(stages), Some(nl)) = (st.stages.as_mut(), self.layers.get(il + 1)) {
+                        stages[(il + 1) % 2].kick(nl, il + 1)?;
+                    }
+                }
+
                 // attention
                 kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, n_tok, eps)?;
+                let mut attn_output_w: &DeviceBuf = &l.attn_output;
                 match &l.attn {
                     Attn::Gqa { attn_q, attn_k, attn_v, q_norm, k_norm } => {
                         kernels::matmul_q8_0(&mut st.q, attn_q, &st.normed, s.n_embd, s.n_head * s.head_dim, n_tok)?;
@@ -1014,23 +1110,41 @@ mod real {
                     Attn::Mla { q_a, q_a_norm, q_b, kv_a_mqa, kv_a_norm, k_b, v_b } => {
                         // ds4's GLM compact-KV decode path: q through the
                         // lora bottleneck, latent kv cached once for all
-                        // heads, attention over all visible rows.
+                        // heads, attention over all visible rows. Each
+                        // pinned weight prefers its staged VRAM copy when
+                        // the background copy already landed.
+                        let stage = st
+                            .stages
+                            .as_ref()
+                            .map(|sg| &sg[il % 2])
+                            .filter(|sg| sg.ready_for(il));
+                        let q_a_w = match stage { Some(sg) if q_a.is_pinned() => &sg.q_a, _ => q_a };
+                        let q_b_w = match stage { Some(sg) if q_b.is_pinned() => &sg.q_b, _ => q_b };
+                        let kv_a_w = match stage { Some(sg) if kv_a_mqa.is_pinned() => &sg.kv_a, _ => kv_a_mqa };
+                        let k_b_w = match stage { Some(sg) if k_b.is_pinned() => &sg.k_b, _ => k_b };
+                        let v_b_w = match stage { Some(sg) if v_b.is_pinned() => &sg.v_b, _ => v_b };
+                        if let Some(sg) = stage {
+                            if l.attn_output.is_pinned() {
+                                attn_output_w = &sg.attn_output;
+                            }
+                        }
+
                         let rope = s.rope_cfg();
                         let kv_raw_dim = s.n_kv_lora + s.qk_rope;
-                        kernels::matmul_q8_0(&mut st.q_rank, q_a, &st.normed, s.n_embd, s.n_lora_q, n_tok)?;
+                        kernels::matmul_q8_0(&mut st.q_rank, q_a_w, &st.normed, s.n_embd, s.n_lora_q, n_tok)?;
                         kernels::rms_norm(&mut st.q_rank_norm, &st.q_rank, q_a_norm, s.n_lora_q, n_tok, eps)?;
-                        kernels::matmul_q8_0(&mut st.q, q_b, &st.q_rank_norm, s.n_lora_q, s.n_head * s.qk_dim(), n_tok)?;
+                        kernels::matmul_q8_0(&mut st.q, q_b_w, &st.q_rank_norm, s.n_lora_q, s.n_head * s.qk_dim(), n_tok)?;
                         kernels::mla_rope_tail(&mut st.q, n_tok, s.n_head, s.qk_dim(), s.qk_rope, pos0, &rope)?;
-                        kernels::matmul_q8_0(&mut st.kv_raw, kv_a_mqa, &st.normed, s.n_embd, kv_raw_dim, n_tok)?;
+                        kernels::matmul_q8_0(&mut st.kv_raw, kv_a_w, &st.normed, s.n_embd, kv_raw_dim, n_tok)?;
                         kernels::mla_kv_lora_rms_norm(&mut st.kv_norm, &st.kv_raw, kv_a_norm, n_tok, kv_raw_dim, s.n_kv_lora, eps)?;
                         kernels::mla_store_compact_kv(&mut st.kcache[il], &mut st.vcache[il], &st.kv_norm, &st.kv_raw, pos0, n_tok, st.ctx, kv_raw_dim, s.n_kv_lora, s.qk_rope)?;
                         let n_sel = pos0 + n_tok;
                         kernels::mla_fill_selected_range(&mut st.mla_selected, n_tok, pos0, n_sel, st.ctx)?;
-                        kernels::mla_qk_lowrank(&mut st.qk_low, &st.q, k_b, n_tok, s.n_head, s.n_kv_lora, s.qk_nope, s.qk_dim())?;
-                        kernels::mla_attention(&mut st.heads, &st.q, &st.qk_low, &st.kcache[il], &st.vcache[il], v_b, &st.mla_selected, n_tok, n_sel, st.ctx, s.n_head, s.n_kv_lora, s.qk_nope, s.qk_rope, s.value_mla, &rope)?;
+                        kernels::mla_qk_lowrank(&mut st.qk_low, &st.q, k_b_w, n_tok, s.n_head, s.n_kv_lora, s.qk_nope, s.qk_dim())?;
+                        kernels::mla_attention(&mut st.heads, &st.q, &st.qk_low, &st.kcache[il], &st.vcache[il], v_b_w, &st.mla_selected, n_tok, n_sel, st.ctx, s.n_head, s.n_kv_lora, s.qk_nope, s.qk_rope, s.value_mla, &rope)?;
                     }
                 }
-                kernels::matmul_q8_0(&mut st.attn_out, &l.attn_output, &st.heads, s.heads_dim(), s.n_embd, n_tok)?;
+                kernels::matmul_q8_0(&mut st.attn_out, attn_output_w, &st.heads, s.heads_dim(), s.n_embd, n_tok)?;
                 kernels::add(&mut st.after_attn, &st.cur, &st.attn_out, n_tok * s.n_embd)?;
 
                 // ffn

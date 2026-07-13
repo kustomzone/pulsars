@@ -155,6 +155,10 @@ mod real {
             self.bytes
         }
 
+        pub fn is_pinned(&self) -> bool {
+            !self.host.is_null()
+        }
+
         pub fn ptr(&self) -> *const c_void {
             self.ptr
         }
@@ -284,6 +288,75 @@ mod real {
 
     pub fn sync() -> Result {
         check_rt(unsafe { cudaDeviceSynchronize() }, "cudaDeviceSynchronize")
+    }
+
+    extern "C" {
+        fn cudaStreamCreateWithFlags(s: *mut *mut c_void, flags: u32) -> i32;
+        fn cudaMemcpyAsync(dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32, stream: *mut c_void) -> i32;
+        fn cudaEventCreateWithFlags(e: *mut *mut c_void, flags: u32) -> i32;
+        fn cudaEventRecord(e: *mut c_void, stream: *mut c_void) -> i32;
+        fn cudaEventQuery(e: *mut c_void) -> i32;
+        fn cudaStreamWaitEvent(stream: *mut c_void, e: *mut c_void, flags: u32) -> i32;
+    }
+
+    /// A side stream + event for best-effort background H2D staging.
+    /// `copy_async` from PINNED sources overlaps default-stream kernels;
+    /// `done()` polls without blocking.
+    pub struct CopyStream {
+        stream: *mut c_void,
+        event: *mut c_void,
+        gate: *mut c_void,
+    }
+
+    unsafe impl Send for CopyStream {}
+
+    impl CopyStream {
+        pub fn new() -> Result<CopyStream> {
+            const NON_BLOCKING: u32 = 1;
+            const DISABLE_TIMING: u32 = 2;
+            let mut stream = std::ptr::null_mut();
+            check_rt(unsafe { cudaStreamCreateWithFlags(&mut stream, NON_BLOCKING) }, "stream create")?;
+            let mut event = std::ptr::null_mut();
+            check_rt(unsafe { cudaEventCreateWithFlags(&mut event, DISABLE_TIMING) }, "event create")?;
+            let mut gate = std::ptr::null_mut();
+            check_rt(unsafe { cudaEventCreateWithFlags(&mut gate, DISABLE_TIMING) }, "gate create")?;
+            Ok(CopyStream { stream, event, gate })
+        }
+
+        /// Make queued-after copies wait for all default-stream work
+        /// submitted so far (the consumers of whatever the arena holds).
+        pub fn gate_behind_default(&self) -> Result {
+            check_rt(unsafe { cudaEventRecord(self.gate, std::ptr::null_mut()) }, "gate record")?;
+            check_rt(unsafe { cudaStreamWaitEvent(self.stream, self.gate, 0) }, "gate wait")
+        }
+
+        /// Queue an async H2D copy of a whole pinned buffer into `dst` at
+        /// `dst_off`. Record the event after the LAST copy of a batch.
+        pub fn copy_from_pinned(&self, dst: &mut DeviceBuf, dst_off: usize, src: &DeviceBuf) -> Result {
+            assert!(!src.host.is_null(), "source must be pinned");
+            assert!(dst_off + src.bytes <= dst.bytes);
+            check_rt(
+                unsafe {
+                    cudaMemcpyAsync(
+                        (dst.ptr as *mut u8).add(dst_off) as *mut c_void,
+                        src.host,
+                        src.bytes,
+                        H2D,
+                        self.stream,
+                    )
+                },
+                "async h2d",
+            )
+        }
+
+        pub fn record(&self) -> Result {
+            check_rt(unsafe { cudaEventRecord(self.event, self.stream) }, "event record")
+        }
+
+        /// True once every copy queued before the last `record` finished.
+        pub fn done(&self) -> bool {
+            unsafe { cudaEventQuery(self.event) == 0 }
+        }
     }
 
     const D2D: i32 = 3;

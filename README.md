@@ -22,11 +22,14 @@ Runs **Hy3 295B** (hy-v3) and **GLM-5.2 743B** (glm-dsa, MLA) on a single
 | long-prompt prefill | **7.9 tok/s** | 0.44 |
 | warm start | 16GB of hot experts in **~4s** | – |
 
-GLM-5.2 (196.6 GiB gguf; the hottest attention tensors take a VRAM
-budget, the rest sit in pinned host RAM, experts streamed): **0.41 tok/s**
-(`PULSAR_ATTN_VRAM_GB=6` on a 16GB card at ctx 2048; NeutronStar: 0.40).
-Teacher-forced parity 10/12 vs the reference - both misses at <0.07-logit
-ties.
+GLM-5.2 (196.6 GiB gguf): **0.56 tok/s** (NeutronStar: 0.40, upstream
+ds4 never ran GLM on CUDA). The attention weights don't fit VRAM, so the
+hottest tensors take a VRAM budget (`PULSAR_ATTN_VRAM_GB`, default 6),
+and the rest live in pinned host RAM with best-effort ping-pong staging:
+layer N+1's weights are async-copied to VRAM under layer N's compute,
+falling back to zero-copy reads if the copy hasn't landed. Teacher-forced
+parity 10/12 vs the reference - both misses at <0.07-logit ties.
+`PULSAR_CACHE_GB=14` squeezes out a bit more on a 30GB-RAM box.
 
 Correctness is certified against ds4, not assumed: teacher-forced along
 ds4's greedy path, 15/16 per-position argmax agreement (the one miss is a
