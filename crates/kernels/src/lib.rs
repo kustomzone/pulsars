@@ -7,6 +7,7 @@ mod ffi {
         pub fn pulsar_gqa_selftest() -> i32;
         pub fn pulsar_q8_0_matmul_selftest() -> i32;
         pub fn pulsar_router_selftest() -> i32;
+        pub fn pulsar_moe_selftest() -> i32;
     }
 }
 
@@ -31,6 +32,13 @@ pub fn router_selftest() -> bool {
     unsafe { ffi::pulsar_router_selftest() != 0 }
 }
 
+/// Run the routed-expert MoE self-test (IQ2_XXS + Q2_K pair-swiglu and
+/// down kernels vs a host dequant reference). Requires a CUDA device.
+#[cfg(target_os = "linux")]
+pub fn moe_selftest() -> bool {
+    unsafe { ffi::pulsar_moe_selftest() != 0 }
+}
+
 #[cfg(test)]
 mod tests {
     /// GPU-required; run explicitly: cargo test -p kernels -- --ignored
@@ -53,5 +61,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn router_select_matches_cpu_reference() {
         assert!(super::router_selftest());
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    #[cfg(target_os = "linux")]
+    fn moe_kernels_match_cpu_reference() {
+        assert!(super::moe_selftest());
     }
 }

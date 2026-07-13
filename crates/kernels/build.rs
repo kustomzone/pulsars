@@ -4,6 +4,7 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=cuda/pulsar_kernels.cu");
     println!("cargo:rerun-if-changed=cuda/gqa_kernels.inc");
+    println!("cargo:rerun-if-changed=cuda/iq2_tables.inc");
     cc::Build::new()
         .cuda(true)
         .flag("-O3")

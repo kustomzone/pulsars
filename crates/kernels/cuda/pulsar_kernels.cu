@@ -1,9 +1,11 @@
 /* pulsar CUDA kernel library.
  *
- * gqa_kernels.inc is derived verbatim from the NeutronStar fork of ds4
- * (github.com/antirez/ds4), MIT License:
+ * gqa_kernels.inc and iq2_tables.inc are derived verbatim from the
+ * NeutronStar fork of ds4 (github.com/antirez/ds4), MIT License:
  *   Copyright (c) 2026 The ds4.c authors
  *   Copyright (c) 2023-2026 The ggml authors
+ * The MoE dequant functors below are ports of ds4's ds4_cuda_glm_moe.inc
+ * (itself a port of metal/moe.metal), same license and attribution.
  * The shim below provides the minimal glue the .inc expects (a tensor is
  * a device pointer plus a byte count) so the kernels build standalone.
  */
@@ -445,6 +447,446 @@ extern "C" int pulsar_router_selftest(void) {
     return router_selftest_one(64, 8, 2.5f, 7) &&
            router_selftest_one(256, 8, 1.0f, 5) &&
            router_selftest_one(96, 6, 1.5f, 1);
+}
+
+/* ---- routed-expert MoE: IQ2_XXS / Q2_K dequant-dot kernels -------------
+ * pair swiglu: mid[tok][slot][row] = silu(gate_row.x) * (up_row.x) * w
+ * down:        out[tok][row]      = sum_slot down_row . mid[tok][slot]
+ * pulsar contract: each (token, slot) carries explicit device pointers to
+ * that expert's gate/up/down slabs (DESIGN-expert-store.md); a NULL slab
+ * means "not routed" and contributes zero. One warp per output row. */
+
+#define PULSAR_QK_K 256u
+
+typedef struct {
+    uint8_t scales[PULSAR_QK_K / 16];
+    uint8_t qs[PULSAR_QK_K / 4];
+    uint16_t d;
+    uint16_t dmin;
+} block_q2_K;
+
+typedef struct {
+    uint16_t d;
+    uint16_t qs[PULSAR_QK_K / 8];
+} block_iq2_xxs;
+
+#include "iq2_tables.inc"
+
+struct deq_q2_K {
+    __device__ __forceinline__ static float value(const char *blocks, uint32_t k) {
+        const block_q2_K *xb = (const block_q2_K *)blocks + (k / PULSAR_QK_K);
+        const uint32_t idx = k & (PULSAR_QK_K - 1u);
+        const uint32_t group = idx / 16u;
+        const uint32_t l = idx & 15u;
+        const uint32_t q_base = 32u * (group / 8u) + 16u * (group & 1u);
+        const uint32_t shift = ((group / 2u) & 3u) * 2u;
+        const uint32_t q = ((uint32_t)xb->qs[q_base + l] >> shift) & 0x03u;
+        const uint32_t sc = (uint32_t)xb->scales[group];
+        return f16_to_f32(xb->d) * (float)(sc & 0x0Fu) * (float)q -
+               f16_to_f32(xb->dmin) * (float)(sc >> 4u);
+    }
+};
+
+struct deq_iq2_xxs {
+    __device__ __forceinline__ static float value(const char *blocks, uint32_t k) {
+        const block_iq2_xxs *xb = (const block_iq2_xxs *)blocks + (k >> 8);
+        const uint32_t within = k & 255u;
+        const uint32_t ib32 = within >> 5;
+        const uint32_t kk = within & 31u;
+        const uint32_t l = kk >> 3;
+        const uint32_t j = kk & 7u;
+        const uint16_t *q2 = xb->qs + 4u * ib32;
+        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+        const uint32_t ls = 2u * (aux1 >> 28) + 1u;
+        const uint32_t grid_idx = (aux0 >> (8u * l)) & 0xffu;
+        const uint32_t sign_idx = (aux1 >> (7u * l)) & 127u;
+        const uint64_t g = cuda_iq2xxs_grid[grid_idx];
+        const int32_t gj = (int32_t)(uint32_t)(uint8_t)(g >> (8u * j));
+        const uint8_t signs = cuda_ksigns_iq2xs[sign_idx];
+        const float sign = (signs & (1u << j)) ? -1.0f : 1.0f;
+        return 0.125f * f16_to_f32(xb->d) * (float)ls * (float)gj * sign;
+    }
+};
+
+typedef struct {
+    const void *gate;
+    const void *up;
+    const void *down;
+} pulsar_expert_ptrs;
+
+template <typename DEQ>
+__global__ static void moe_pair_swiglu_kernel(
+        float *mid,                     /* [n_tok][n_used][mid_dim] */
+        const pulsar_expert_ptrs *ptrs, /* [n_tok][n_used] */
+        const float *weights,           /* [n_tok][n_used] */
+        const float *x,                 /* [n_tok][in_dim] */
+        uint32_t in_dim,
+        uint32_t mid_dim,
+        uint32_t n_used,
+        uint32_t n_tok,
+        uint64_t row_bytes) {           /* gate and up share type+in_dim */
+    const uint32_t lane = threadIdx.x;
+    const uint32_t row = blockIdx.x * blockDim.y + threadIdx.y;
+    const uint32_t slot = blockIdx.y;
+    const uint32_t token = blockIdx.z;
+    if (row >= mid_dim || slot >= n_used || token >= n_tok) return;
+
+    const uint64_t slot_off = (uint64_t)token * n_used + slot;
+    const uint64_t mid_off = slot_off * mid_dim + row;
+    const pulsar_expert_ptrs p = ptrs[slot_off];
+    if (!p.gate || !p.up) {
+        if (lane == 0) mid[mid_off] = 0.0f;
+        return;
+    }
+
+    const char *gate_row = (const char *)p.gate + (uint64_t)row * row_bytes;
+    const char *up_row = (const char *)p.up + (uint64_t)row * row_bytes;
+    const float *token_x = x + (uint64_t)token * in_dim;
+
+    float acc_gate = 0.0f;
+    float acc_up = 0.0f;
+    for (uint32_t k = lane; k < in_dim; k += 32u) {
+        const float xv = token_x[k];
+        acc_gate += DEQ::value(gate_row, k) * xv;
+        acc_up += DEQ::value(up_row, k) * xv;
+    }
+    #pragma unroll
+    for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
+        acc_gate += __shfl_xor_sync(0xffffffffu, acc_gate, mask);
+        acc_up += __shfl_xor_sync(0xffffffffu, acc_up, mask);
+    }
+    if (lane == 0) {
+        const float g = acc_gate;
+        const float sw = g / (1.0f + expf(-g));
+        mid[mid_off] = sw * acc_up * weights[slot_off];
+    }
+}
+
+template <typename DEQ>
+__global__ static void moe_down_kernel(
+        float *out,                     /* [n_tok][out_dim] */
+        const pulsar_expert_ptrs *ptrs, /* [n_tok][n_used] */
+        const float *mid,               /* [n_tok][n_used][mid_dim] */
+        uint32_t mid_dim,
+        uint32_t out_dim,
+        uint32_t n_used,
+        uint32_t n_tok,
+        uint64_t row_bytes) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t row = blockIdx.x * blockDim.y + threadIdx.y;
+    const uint32_t token = blockIdx.y;
+    if (row >= out_dim || token >= n_tok) return;
+
+    const uint64_t slot_base = (uint64_t)token * n_used;
+    float acc = 0.0f;
+    for (uint32_t slot = 0; slot < n_used; slot++) {
+        const pulsar_expert_ptrs p = ptrs[slot_base + slot];
+        if (!p.down) continue;
+        const char *down_row = (const char *)p.down + (uint64_t)row * row_bytes;
+        const float *slot_mid = mid + (slot_base + slot) * mid_dim;
+        for (uint32_t k = lane; k < mid_dim; k += 32u) {
+            acc += DEQ::value(down_row, k) * slot_mid[k];
+        }
+    }
+    #pragma unroll
+    for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, mask);
+    }
+    if (lane == 0) out[(uint64_t)token * out_dim + row] = acc;
+}
+
+enum {
+    PULSAR_QUANT_Q2_K = 0,
+    PULSAR_QUANT_IQ2_XXS = 1,
+};
+
+extern "C" int pulsar_moe_pair_swiglu(
+        void *mid_dev,
+        const void *ptrs_dev,
+        const void *weights_dev,
+        const void *x_dev,
+        uint32_t in_dim,
+        uint32_t mid_dim,
+        uint32_t n_used,
+        uint32_t n_tok,
+        uint64_t row_bytes,
+        uint32_t quant) {
+    if (in_dim == 0 || in_dim % PULSAR_QK_K != 0 || mid_dim == 0 ||
+        n_used == 0 || n_tok == 0 || row_bytes == 0) {
+        return 0;
+    }
+    dim3 block(32, 4, 1);
+    dim3 grid((mid_dim + 3u) / 4u, n_used, n_tok);
+    switch (quant) {
+    case PULSAR_QUANT_Q2_K:
+        moe_pair_swiglu_kernel<deq_q2_K><<<grid, block>>>(
+                (float *)mid_dev, (const pulsar_expert_ptrs *)ptrs_dev,
+                (const float *)weights_dev, (const float *)x_dev,
+                in_dim, mid_dim, n_used, n_tok, row_bytes);
+        break;
+    case PULSAR_QUANT_IQ2_XXS:
+        moe_pair_swiglu_kernel<deq_iq2_xxs><<<grid, block>>>(
+                (float *)mid_dev, (const pulsar_expert_ptrs *)ptrs_dev,
+                (const float *)weights_dev, (const float *)x_dev,
+                in_dim, mid_dim, n_used, n_tok, row_bytes);
+        break;
+    default:
+        return 0;
+    }
+    return cuda_ok(cudaGetLastError(), "moe pair swiglu launch");
+}
+
+extern "C" int pulsar_moe_down(
+        void *out_dev,
+        const void *ptrs_dev,
+        const void *mid_dev,
+        uint32_t mid_dim,
+        uint32_t out_dim,
+        uint32_t n_used,
+        uint32_t n_tok,
+        uint64_t row_bytes,
+        uint32_t quant) {
+    if (mid_dim == 0 || mid_dim % PULSAR_QK_K != 0 || out_dim == 0 ||
+        n_used == 0 || n_tok == 0 || row_bytes == 0) {
+        return 0;
+    }
+    dim3 block(32, 4, 1);
+    dim3 grid((out_dim + 3u) / 4u, n_tok, 1);
+    switch (quant) {
+    case PULSAR_QUANT_Q2_K:
+        moe_down_kernel<deq_q2_K><<<grid, block>>>(
+                (float *)out_dev, (const pulsar_expert_ptrs *)ptrs_dev,
+                (const float *)mid_dev, mid_dim, out_dim, n_used, n_tok,
+                row_bytes);
+        break;
+    case PULSAR_QUANT_IQ2_XXS:
+        moe_down_kernel<deq_iq2_xxs><<<grid, block>>>(
+                (float *)out_dev, (const pulsar_expert_ptrs *)ptrs_dev,
+                (const float *)mid_dev, mid_dim, out_dim, n_used, n_tok,
+                row_bytes);
+        break;
+    default:
+        return 0;
+    }
+    return cuda_ok(cudaGetLastError(), "moe down launch");
+}
+
+/* ---- MoE selftest: random quantized slabs vs a host dequant reference -- */
+
+static uint8_t test_randbyte(void) {
+    return (uint8_t)lrintf((gqa_test_randf() * 0.5f + 0.5f) * 255.0f);
+}
+
+/* host mirrors of the device dequant functors; tables fetched from the
+ * device so both sides read identical constants */
+static uint8_t h_ksigns[128];
+static uint64_t h_grid[256];
+
+static float host_deq_q2_K(const char *blocks, uint32_t k) {
+    const block_q2_K *xb = (const block_q2_K *)blocks + (k / PULSAR_QK_K);
+    const uint32_t idx = k & (PULSAR_QK_K - 1u);
+    const uint32_t group = idx / 16u;
+    const uint32_t l = idx & 15u;
+    const uint32_t q_base = 32u * (group / 8u) + 16u * (group & 1u);
+    const uint32_t shift = ((group / 2u) & 3u) * 2u;
+    const uint32_t q = ((uint32_t)xb->qs[q_base + l] >> shift) & 0x03u;
+    const uint32_t sc = (uint32_t)xb->scales[group];
+    return f16_to_f32_host(xb->d) * (float)(sc & 0x0Fu) * (float)q -
+           f16_to_f32_host(xb->dmin) * (float)(sc >> 4u);
+}
+
+static float host_deq_iq2_xxs(const char *blocks, uint32_t k) {
+    const block_iq2_xxs *xb = (const block_iq2_xxs *)blocks + (k >> 8);
+    const uint32_t within = k & 255u;
+    const uint32_t ib32 = within >> 5;
+    const uint32_t kk = within & 31u;
+    const uint32_t l = kk >> 3;
+    const uint32_t j = kk & 7u;
+    const uint16_t *q2 = xb->qs + 4u * ib32;
+    const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+    const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+    const uint32_t ls = 2u * (aux1 >> 28) + 1u;
+    const uint32_t grid_idx = (aux0 >> (8u * l)) & 0xffu;
+    const uint32_t sign_idx = (aux1 >> (7u * l)) & 127u;
+    const uint64_t g = h_grid[grid_idx];
+    const int32_t gj = (int32_t)(uint32_t)(uint8_t)(g >> (8u * j));
+    const uint8_t signs = h_ksigns[sign_idx];
+    const float sign = (signs & (1u << j)) ? -1.0f : 1.0f;
+    return 0.125f * f16_to_f32_host(xb->d) * (float)ls * (float)gj * sign;
+}
+
+static void fill_slab(char *slab, uint32_t n_rows, uint32_t n_el,
+                      uint64_t row_bytes, uint32_t quant) {
+    for (uint32_t r = 0; r < n_rows; r++) {
+        char *row = slab + (uint64_t)r * row_bytes;
+        for (uint64_t b = 0; b < row_bytes; b++) row[b] = (char)test_randbyte();
+        /* overwrite scale halves with sane small values (random f16 bits
+         * can be inf/nan) */
+        for (uint32_t blk = 0; blk < n_el / PULSAR_QK_K; blk++) {
+            if (quant == PULSAR_QUANT_Q2_K) {
+                block_q2_K *q = (block_q2_K *)row + blk;
+                q->d = f32_to_f16_bits(fabsf(gqa_test_randf()) * 0.05f + 0.001f);
+                q->dmin = f32_to_f16_bits(fabsf(gqa_test_randf()) * 0.05f);
+            } else {
+                block_iq2_xxs *q = (block_iq2_xxs *)row + blk;
+                q->d = f32_to_f16_bits(fabsf(gqa_test_randf()) * 0.1f + 0.001f);
+            }
+        }
+    }
+}
+
+static int moe_selftest_one(uint32_t quant, const char *name) {
+    const uint32_t in_dim = 512, mid_dim = 256, out_dim = 320;
+    const uint32_t n_expert = 8, n_used = 4, n_tok = 3;
+    const uint64_t pair_row_bytes = (uint64_t)(in_dim / PULSAR_QK_K) *
+        (quant == PULSAR_QUANT_Q2_K ? sizeof(block_q2_K) : sizeof(block_iq2_xxs));
+    const uint64_t down_row_bytes = (uint64_t)(mid_dim / PULSAR_QK_K) *
+        (quant == PULSAR_QUANT_Q2_K ? sizeof(block_q2_K) : sizeof(block_iq2_xxs));
+    const uint64_t gate_slab_bytes = (uint64_t)n_expert * mid_dim * pair_row_bytes;
+    const uint64_t down_slab_bytes = (uint64_t)n_expert * out_dim * down_row_bytes;
+    float (*deq)(const char *, uint32_t) =
+        quant == PULSAR_QUANT_Q2_K ? host_deq_q2_K : host_deq_iq2_xxs;
+
+    char *gate = (char *)malloc(gate_slab_bytes);
+    char *up = (char *)malloc(gate_slab_bytes);
+    char *down = (char *)malloc(down_slab_bytes);
+    float *x = (float *)malloc((uint64_t)n_tok * in_dim * sizeof(float));
+    float *w = (float *)malloc((uint64_t)n_tok * n_used * sizeof(float));
+    int32_t *sel = (int32_t *)malloc((uint64_t)n_tok * n_used * sizeof(int32_t));
+    float *mid_ref = (float *)calloc((uint64_t)n_tok * n_used * mid_dim, sizeof(float));
+    float *out_ref = (float *)calloc((uint64_t)n_tok * out_dim, sizeof(float));
+    float *mid_gpu = (float *)malloc((uint64_t)n_tok * n_used * mid_dim * sizeof(float));
+    float *out_gpu = (float *)malloc((uint64_t)n_tok * out_dim * sizeof(float));
+
+    fill_slab(gate, n_expert * mid_dim, in_dim, pair_row_bytes, quant);
+    fill_slab(up, n_expert * mid_dim, in_dim, pair_row_bytes, quant);
+    fill_slab(down, n_expert * out_dim, mid_dim, down_row_bytes, quant);
+    for (uint64_t i = 0; i < (uint64_t)n_tok * in_dim; i++) x[i] = gqa_test_randf();
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t s = 0; s < n_used; s++) {
+            sel[t * n_used + s] = (int32_t)(test_randbyte() % n_expert);
+            w[t * n_used + s] = fabsf(gqa_test_randf()) + 0.1f;
+        }
+    }
+    sel[1 * n_used + 2] = -1; /* one unrouted slot: NULL ptrs, zero output */
+
+    void *gate_dev = NULL, *up_dev = NULL, *down_dev = NULL;
+    void *x_dev = NULL, *w_dev = NULL, *ptrs_dev = NULL;
+    void *mid_dev = NULL, *out_dev = NULL;
+    pulsar_expert_ptrs ptrs[n_tok * n_used];
+    int ok = cuda_ok(cudaMalloc(&gate_dev, gate_slab_bytes), "gate alloc") &&
+             cuda_ok(cudaMalloc(&up_dev, gate_slab_bytes), "up alloc") &&
+             cuda_ok(cudaMalloc(&down_dev, down_slab_bytes), "down alloc") &&
+             cuda_ok(cudaMalloc(&x_dev, (uint64_t)n_tok * in_dim * sizeof(float)), "x alloc") &&
+             cuda_ok(cudaMalloc(&w_dev, (uint64_t)n_tok * n_used * sizeof(float)), "w alloc") &&
+             cuda_ok(cudaMalloc(&ptrs_dev, sizeof(ptrs)), "ptrs alloc") &&
+             cuda_ok(cudaMalloc(&mid_dev, (uint64_t)n_tok * n_used * mid_dim * sizeof(float)), "mid alloc") &&
+             cuda_ok(cudaMalloc(&out_dev, (uint64_t)n_tok * out_dim * sizeof(float)), "out alloc") &&
+             cuda_ok(cudaMemcpy(gate_dev, gate, gate_slab_bytes, cudaMemcpyHostToDevice), "gate h2d") &&
+             cuda_ok(cudaMemcpy(up_dev, up, gate_slab_bytes, cudaMemcpyHostToDevice), "up h2d") &&
+             cuda_ok(cudaMemcpy(down_dev, down, down_slab_bytes, cudaMemcpyHostToDevice), "down h2d") &&
+             cuda_ok(cudaMemcpy(x_dev, x, (uint64_t)n_tok * in_dim * sizeof(float), cudaMemcpyHostToDevice), "x h2d") &&
+             cuda_ok(cudaMemcpy(w_dev, w, (uint64_t)n_tok * n_used * sizeof(float), cudaMemcpyHostToDevice), "w h2d");
+
+    for (uint32_t i = 0; i < n_tok * n_used; i++) {
+        const int32_t e = sel[i];
+        if (e < 0) {
+            ptrs[i].gate = ptrs[i].up = ptrs[i].down = NULL;
+            continue;
+        }
+        ptrs[i].gate = (char *)gate_dev + (uint64_t)e * mid_dim * pair_row_bytes;
+        ptrs[i].up = (char *)up_dev + (uint64_t)e * mid_dim * pair_row_bytes;
+        ptrs[i].down = (char *)down_dev + (uint64_t)e * out_dim * down_row_bytes;
+    }
+    ok = ok && cuda_ok(cudaMemcpy(ptrs_dev, ptrs, sizeof(ptrs), cudaMemcpyHostToDevice), "ptrs h2d") &&
+         pulsar_moe_pair_swiglu(mid_dev, ptrs_dev, w_dev, x_dev,
+                                in_dim, mid_dim, n_used, n_tok,
+                                pair_row_bytes, quant) &&
+         pulsar_moe_down(out_dev, ptrs_dev, mid_dev, mid_dim, out_dim,
+                         n_used, n_tok, down_row_bytes, quant) &&
+         cuda_ok(cudaDeviceSynchronize(), "sync") &&
+         cuda_ok(cudaMemcpy(mid_gpu, mid_dev, (uint64_t)n_tok * n_used * mid_dim * sizeof(float), cudaMemcpyDeviceToHost), "mid d2h") &&
+         cuda_ok(cudaMemcpy(out_gpu, out_dev, (uint64_t)n_tok * out_dim * sizeof(float), cudaMemcpyDeviceToHost), "out d2h");
+
+    /* host reference */
+    for (uint32_t t = 0; t < n_tok && ok; t++) {
+        for (uint32_t s = 0; s < n_used; s++) {
+            const int32_t e = sel[t * n_used + s];
+            if (e < 0) continue;
+            const char *gs = gate + (uint64_t)e * mid_dim * pair_row_bytes;
+            const char *us = up + (uint64_t)e * mid_dim * pair_row_bytes;
+            for (uint32_t r = 0; r < mid_dim; r++) {
+                double ag = 0.0, au = 0.0;
+                const char *gr = gs + (uint64_t)r * pair_row_bytes;
+                const char *ur = us + (uint64_t)r * pair_row_bytes;
+                for (uint32_t k = 0; k < in_dim; k++) {
+                    const double xv = x[(uint64_t)t * in_dim + k];
+                    ag += (double)deq(gr, k) * xv;
+                    au += (double)deq(ur, k) * xv;
+                }
+                const double sw = ag / (1.0 + exp(-ag));
+                mid_ref[((uint64_t)t * n_used + s) * mid_dim + r] =
+                    (float)(sw * au * w[t * n_used + s]);
+            }
+        }
+        for (uint32_t r = 0; r < out_dim; r++) {
+            double acc = 0.0;
+            for (uint32_t s = 0; s < n_used; s++) {
+                const int32_t e = sel[t * n_used + s];
+                if (e < 0) continue;
+                const char *dr = down + (uint64_t)e * out_dim * down_row_bytes +
+                                 (uint64_t)r * down_row_bytes;
+                const float *sm = mid_ref + ((uint64_t)t * n_used + s) * mid_dim;
+                for (uint32_t k = 0; k < mid_dim; k++)
+                    acc += (double)deq(dr, k) * sm[k];
+            }
+            out_ref[(uint64_t)t * out_dim + r] = (float)acc;
+        }
+    }
+
+    float mid_maxd = 0.0f, mid_maxref = 0.0f, out_maxd = 0.0f, out_maxref = 0.0f;
+    if (ok) {
+        for (uint64_t i = 0; i < (uint64_t)n_tok * n_used * mid_dim; i++) {
+            const float d = fabsf(mid_gpu[i] - mid_ref[i]);
+            if (d > mid_maxd) mid_maxd = d;
+            const float a = fabsf(mid_ref[i]);
+            if (a > mid_maxref) mid_maxref = a;
+        }
+        for (uint64_t i = 0; i < (uint64_t)n_tok * out_dim; i++) {
+            const float d = fabsf(out_gpu[i] - out_ref[i]);
+            if (d > out_maxd) out_maxd = d;
+            const float a = fabsf(out_ref[i]);
+            if (a > out_maxref) out_maxref = a;
+        }
+        ok = mid_maxd <= 1e-3f * (mid_maxref > 1.0f ? mid_maxref : 1.0f) &&
+             out_maxd <= 2e-3f * (out_maxref > 1.0f ? out_maxref : 1.0f);
+    }
+    fprintf(stderr, "moe-selftest %s: %s (mid max diff %.2e, out max diff %.2e, max |out ref| %.2e)\n",
+            name, ok ? "PASS" : "FAIL", (double)mid_maxd, (double)out_maxd,
+            (double)out_maxref);
+    if (gate_dev) cudaFree(gate_dev);
+    if (up_dev) cudaFree(up_dev);
+    if (down_dev) cudaFree(down_dev);
+    if (x_dev) cudaFree(x_dev);
+    if (w_dev) cudaFree(w_dev);
+    if (ptrs_dev) cudaFree(ptrs_dev);
+    if (mid_dev) cudaFree(mid_dev);
+    if (out_dev) cudaFree(out_dev);
+    free(gate); free(up); free(down); free(x); free(w); free(sel);
+    free(mid_ref); free(out_ref); free(mid_gpu); free(out_gpu);
+    return ok;
+}
+
+extern "C" int pulsar_moe_selftest(void) {
+    if (!cuda_ok(cudaMemcpyFromSymbol(h_ksigns, cuda_ksigns_iq2xs,
+                                      sizeof(h_ksigns)), "ksigns fetch") ||
+        !cuda_ok(cudaMemcpyFromSymbol(h_grid, cuda_iq2xxs_grid,
+                                      sizeof(h_grid)), "grid fetch")) {
+        return 0;
+    }
+    return moe_selftest_one(PULSAR_QUANT_Q2_K, "q2_K") &&
+           moe_selftest_one(PULSAR_QUANT_IQ2_XXS, "iq2_xxs");
 }
 
 extern "C" int pulsar_gqa_selftest(void) { return ds4_gpu_gqa_selftest(); }
