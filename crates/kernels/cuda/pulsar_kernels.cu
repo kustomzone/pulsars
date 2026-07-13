@@ -1177,4 +1177,45 @@ extern "C" int pulsar_glue_selftest(void) {
     return ok;
 }
 
+/* ---- raw-pointer wrappers over the gqa inc (its wrappers take shim
+ * tensors; Rust passes device pointers) ---------------------------------- */
+
+static ds4_gpu_tensor shim(const void *ptr) {
+    ds4_gpu_tensor t;
+    t.ptr = (void *)ptr;
+    t.bytes = UINT64_MAX; /* the inc wrappers never consult bytes */
+    return t;
+}
+
+extern "C" int pulsar_gqa_head_rms_norm(
+        void *x, const void *w, uint32_t rows, uint32_t head_dim, float eps) {
+    ds4_gpu_tensor xt = shim(x), wt = shim(w);
+    return ds4_gpu_gqa_head_rms_norm_weight(&xt, &wt, rows, head_dim, eps);
+}
+
+extern "C" int pulsar_gqa_rope(
+        void *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
+        uint32_t pos0, float theta) {
+    ds4_gpu_tensor xt = shim(x);
+    return ds4_gpu_gqa_rope(&xt, n_tok, n_head, head_dim, pos0, theta);
+}
+
+extern "C" int pulsar_gqa_kv_append(
+        void *cache, const void *kv, uint32_t n_tok, uint32_t n_kv_head,
+        uint32_t head_dim, uint32_t cap, uint32_t pos0) {
+    ds4_gpu_tensor ct = shim(cache), kt = shim(kv);
+    return ds4_gpu_gqa_kv_cache_append(&ct, &kt, n_tok, n_kv_head, head_dim,
+                                       cap, pos0);
+}
+
+extern "C" int pulsar_gqa_attention(
+        void *out, const void *q, const void *k_cache, const void *v_cache,
+        uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
+        uint32_t head_dim, uint32_t cap, uint32_t pos0) {
+    ds4_gpu_tensor ot = shim(out), qt = shim(q), kt = shim(k_cache),
+                   vt = shim(v_cache);
+    return ds4_gpu_gqa_attention(&ot, &qt, &kt, &vt, n_tok, n_head,
+                                 n_kv_head, head_dim, cap, pos0);
+}
+
 extern "C" int pulsar_gqa_selftest(void) { return ds4_gpu_gqa_selftest(); }
