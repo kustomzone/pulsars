@@ -13,14 +13,18 @@ a neutron star that spins fast and emits beams.
 
 ## What it does today
 
-Runs **Hy3 295B** (hy-v3, 192 experts, ~85GB gguf) on a single
+Runs **Hy3 295B** (hy-v3) and **GLM-5.2 743B** (glm-dsa, MLA) on a single
 **RTX 4060 Ti 16GB**:
 
-| | pulsar | ds4 (reference C engine, same box) |
+| Hy3 295B (~85GB gguf) | pulsar | ds4 (reference C engine, same box) |
 |---|---|---|
 | decode | **2.6 tok/s** | 0.64–0.70 |
 | long-prompt prefill | **7.9 tok/s** | 0.44 |
 | warm start | 16GB of hot experts in **~4s** | – |
+
+GLM-5.2 (196.6 GiB gguf, ~12GB of attention weights auto-placed in pinned
+host RAM, experts streamed): 0.32 tok/s, teacher-forced parity 10/12 vs
+the reference (both misses at <0.07-logit ties).
 
 Correctness is certified against ds4, not assumed: teacher-forced along
 ds4's greedy path, 15/16 per-position argmax agreement (the one miss is a
@@ -149,8 +153,8 @@ streaming; local single-user, one request at a time).
 
 Not yet:
 
-- other model families (GLM/DeepSeek MLA graphs — the expert/router
-  kernels already cover their quants; the attention graph is the work)
+- DeepSeek-family bring-up (same MLA plumbing as GLM; the DSA indexer for
+  long contexts is unported — GLM runs full attention up to ctx 2048)
 - multi-GPU expert residency (2× RTX 5060 Ti target — the reason this
   engine exists)
 - MTP speculative decode (parked until batch-union expert loads, its
