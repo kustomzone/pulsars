@@ -16,7 +16,7 @@ Runs **Hy3 295B** (hy-v3, 192 experts, ~85GB gguf) on a single
 
 | | pulsar | ds4 (reference C engine, same box) |
 |---|---|---|
-| decode | **2.2–2.7 tok/s** | 0.64–0.70 |
+| decode | **2.6 tok/s** | 0.64–0.70 |
 | long-prompt prefill | **5.4 tok/s** | 0.44 |
 | warm start | 16GB of hot experts in **~4s** | – |
 
