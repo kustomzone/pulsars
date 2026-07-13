@@ -30,6 +30,7 @@ fn run() -> engine::Result {
     let mut bos = true;
     let mut dump_logits = None;
     let mut teacher_force = false;
+    let mut decode_consistency = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -43,6 +44,7 @@ fn run() -> engine::Result {
             "--no-bos" => bos = false,
             "--dump-logits" => dump_logits = Some(need("--dump-logits")?),
             "--teacher-force" => teacher_force = true,
+            "--decode-consistency" => decode_consistency = Some(need("--decode-consistency")?.parse::<usize>()?),
             other => return Err(format!("unknown arg {other}").into()),
         }
     }
@@ -92,6 +94,68 @@ fn run() -> engine::Result {
                 .collect();
             println!("{{\"pos\":{},\"after\":{},\"top\":[{}]}}", i, id, entries.join(","));
         }
+        return Ok(());
+    }
+
+    if let Some(nsteps) = decode_consistency {
+        // Greedy-decode nsteps tokens through the incremental (n_tok=1)
+        // path, then fresh-prefill the identical sequence batched and
+        // compare the logits at the same position. Divergence here is the
+        // reduction-order drift between the batch and decode matmul
+        // kernels - the ds4 --decode-consistency analogue.
+        let mut logits = None;
+        let mut pos0 = 0u32;
+        for chunk in prompt_ids.chunks(st.max_batch() as usize) {
+            logits = model.forward_batch(&mut st, chunk, pos0, true)?;
+            pos0 += chunk.len() as u32;
+        }
+        let mut seq = prompt_ids.clone();
+        for _ in 0..nsteps.saturating_sub(1) {
+            let next = engine::argmax(logits.as_ref().ok_or("no logits")?);
+            seq.push(next);
+            logits = model.forward_batch(&mut st, &[next], seq.len() as u32 - 1, true)?;
+        }
+        let decode_logits = logits.ok_or("no logits")?;
+        let decode_argmax = engine::argmax(&decode_logits);
+
+        drop(st); // free VRAM before the fresh state
+        let mut st2 = engine::State::new(&model, ctx)?;
+        let mut fresh = None;
+        let mut pos0 = 0u32;
+        for chunk in seq.chunks(st2.max_batch() as usize) {
+            fresh = model.forward_batch(&mut st2, chunk, pos0, true)?;
+            pos0 += chunk.len() as u32;
+        }
+        let fresh_logits = fresh.ok_or("no logits")?;
+        let fresh_argmax = engine::argmax(&fresh_logits);
+
+        let mut maxd = 0f32;
+        let mut sum = 0f64;
+        for (a, b) in decode_logits.iter().zip(&fresh_logits) {
+            let d = (a - b).abs();
+            maxd = maxd.max(d);
+            sum += d as f64;
+        }
+        let gap = {
+            let mut top = f32::NEG_INFINITY;
+            let mut second = f32::NEG_INFINITY;
+            for &v in &decode_logits {
+                if v > top {
+                    second = top;
+                    top = v;
+                } else if v > second {
+                    second = v;
+                }
+            }
+            top - second
+        };
+        println!(
+            "decode-consistency after {} steps ({} total tokens):\n  max |dlogit| {maxd:.4}, mean {:.5}\n  argmax decode={decode_argmax} fresh-prefill={fresh_argmax} ({}), decode top1-top2 gap {gap:.4}",
+            nsteps,
+            seq.len(),
+            sum / decode_logits.len() as f64,
+            if decode_argmax == fresh_argmax { "MATCH" } else { "FLIP" },
+        );
         return Ok(());
     }
 
