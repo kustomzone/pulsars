@@ -200,6 +200,18 @@ fn run() -> engine::Result {
     };
     eprintln!("pulsar: prompt ids {prompt_ids:?}");
 
+    // Long prompts want one big prefill chunk (each chunk costs a full
+    // expert-corpus pass) and can trade VRAM pool for it - the pool barely
+    // hits during prefill anyway. Explicit env vars win.
+    if prompt_ids.len() > 384 {
+        if std::env::var_os("PULSAR_BATCH").is_none() {
+            std::env::set_var("PULSAR_BATCH", prompt_ids.len().min(768).to_string());
+        }
+        if std::env::var_os("PULSAR_DEV_CACHE_GB").is_none() {
+            std::env::set_var("PULSAR_DEV_CACHE_GB", "2");
+        }
+    }
+
     let mut st = engine::State::new(&model, ctx)?;
 
     if teacher_force {

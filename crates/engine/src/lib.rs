@@ -1085,6 +1085,36 @@ mod real {
                                 let _ = st.prefetcher.req_tx.send(reads);
                             }
                         }
+                        // Prefill layer pipeline: a batch chunk touches
+                        // ~every expert, so the next layer's want-list
+                        // needs no prediction - it is all of them. Ship it
+                        // to the background fetcher so the disk runs under
+                        // this layer's GPU compute (ds4's ping-pong
+                        // full-layer load, via the host-cache channel).
+                        if n_tok > 1 && std::env::var_os("PULSAR_NO_PREFETCH").is_none() {
+                            if let Some(Ffn::Moe {
+                                gate_exps: ng, up_exps: nu, down_exps: nd, ..
+                            }) = self.layers.get(il + 1).map(|nl| &nl.ffn)
+                            {
+                                let mut reads = Vec::with_capacity(3 * s.n_expert as usize);
+                                for e in 0..s.n_expert as u64 {
+                                    for t in [ng, nu, nd] {
+                                        let offset = t.abs_offset + e * t.expert_bytes;
+                                        if !st.store.contains(offset)
+                                            && !st.dev_cache.map.contains_key(&offset)
+                                        {
+                                            reads.push(stream::Read {
+                                                offset,
+                                                len: t.expert_bytes,
+                                            });
+                                        }
+                                    }
+                                }
+                                if !reads.is_empty() {
+                                    let _ = st.prefetcher.req_tx.send(reads);
+                                }
+                            }
+                        }
                         // absorb whatever the prefetcher finished
                         while let Ok((off, slab)) = st.prefetcher.done_rx.try_recv() {
                             st.store.absorb(off, slab);
