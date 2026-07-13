@@ -170,6 +170,35 @@ mod real {
         tick: u64,
     }
 
+    /// Cross-layer prefetcher: a background thread with its own io_uring
+    /// fd fetches predicted next-layer expert slabs while the main thread
+    /// resolves the current layer and the GPU computes. Slabs come back
+    /// over a channel (ownership moves; no shared cache locking) and are
+    /// absorbed into the host cache at the next resolve.
+    pub struct Prefetcher {
+        req_tx: std::sync::mpsc::Sender<Vec<stream::Read>>,
+        done_rx: std::sync::mpsc::Receiver<(u64, stream::fetch::Slab)>,
+    }
+
+    impl Prefetcher {
+        fn spawn(path: &Path) -> Result<Prefetcher> {
+            let mut fetcher = stream::fetch::Fetcher::open(path, 16)?;
+            let (req_tx, req_rx) = std::sync::mpsc::channel::<Vec<stream::Read>>();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                while let Ok(first) = req_rx.recv() {
+                    // stale requests are useless; keep only the newest
+                    let reads = req_rx.try_iter().last().unwrap_or(first);
+                    let _ = fetcher.fetch_each(&reads, |i, slab| {
+                        let _ = done_tx.send((reads[i].offset, slab));
+                        Ok(())
+                    });
+                }
+            });
+            Ok(Prefetcher { req_tx, done_rx })
+        }
+    }
+
     /// Device-side expert slab cache: a uniform-slot VRAM pool holding a
     /// STABLE hot set. The pool is smaller than one token's slab working
     /// set, so plain LFU would evict everything every token; instead every
@@ -365,6 +394,31 @@ mod real {
             self.hits = 0;
             self.misses = 0;
         }
+
+        fn contains(&self, offset: u64) -> bool {
+            self.cache.contains_key(&offset)
+        }
+
+        /// Take ownership of a prefetched slab (evicting to budget).
+        fn absorb(&mut self, offset: u64, slab: stream::fetch::Slab) {
+            if self.cache.contains_key(&offset) {
+                return;
+            }
+            let incoming = slab.bytes();
+            while self.used + incoming > self.budget && !self.cache.is_empty() {
+                let victim = self
+                    .cache
+                    .iter()
+                    .min_by_key(|(_, e)| (e.freq, e.tick))
+                    .map(|(k, _)| *k);
+                let Some(k) = victim else { break };
+                if let Some(e) = self.cache.remove(&k) {
+                    self.used -= e.slab.bytes();
+                }
+            }
+            self.used += incoming;
+            self.cache.insert(offset, CacheEntry { slab, freq: 1, tick: self.tick });
+        }
     }
 
     fn warm_path(model: &Path) -> std::path::PathBuf {
@@ -500,6 +554,10 @@ mod real {
         vcache: Vec<DeviceBuf>,
         logits: DeviceBuf,
         pub store: StreamingStore,
+        prefetcher: Prefetcher,
+        pred_logits: DeviceBuf,
+        pred_selected: DeviceBuf,
+        pred_weights: DeviceBuf,
     }
 
     impl State {
@@ -664,6 +722,10 @@ mod real {
                 vcache,
                 logits: f32s(s.n_vocab)?,
                 store: StreamingStore::open(&m.path, cache_bytes)?,
+                prefetcher: Prefetcher::spawn(&m.path)?,
+                pred_logits: f32s(s.n_expert)?,
+                pred_selected: DeviceBuf::alloc(n_used * 4)?,
+                pred_weights: f32s(s.n_expert_used)?,
             };
             let t0 = std::time::Instant::now();
             let warmed = st.load_warm(m)?;
@@ -752,6 +814,36 @@ mod real {
                             n_tok,
                         )?;
 
+                        // Cross-layer prefetch (decode only): run the NEXT
+                        // MoE layer's router on THIS layer's ffn input and
+                        // ship the predicted slabs to the background
+                        // fetcher. Rides the sync we need anyway.
+                        let next_moe = if n_tok == 1
+                            && std::env::var_os("PULSAR_NO_PREFETCH").is_none()
+                        {
+                            self.layers.get(il + 1).and_then(|nl| match &nl.ffn {
+                                Ffn::Moe { gate_inp, probs_b, gate_exps, up_exps, down_exps, .. } => {
+                                    Some((gate_inp, probs_b, [gate_exps, up_exps, down_exps]))
+                                }
+                                _ => None,
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some((n_gate_inp, n_probs_b, _)) = &next_moe {
+                            kernels::matmul_f32(&mut st.pred_logits, n_gate_inp, &st.normed, s.n_embd, s.n_expert, 1)?;
+                            kernels::router_select(
+                                &mut st.pred_selected,
+                                &mut st.pred_weights,
+                                &st.pred_logits,
+                                n_probs_b,
+                                s.n_expert,
+                                s.n_expert_used,
+                                s.expert_weight_scale,
+                                1,
+                            )?;
+                        }
+
                         // Expert resolve, batched: the union of distinct
                         // experts across all tokens fetches once. VRAM
                         // cache first, then host LFU + one io_uring batch.
@@ -759,6 +851,30 @@ mod real {
                         let selected = st
                             .router_selected
                             .read_i32(n_tok as usize * s.n_expert_used as usize)?;
+                        if let Some((_, _, next_exps)) = &next_moe {
+                            let pred = st.pred_selected.read_i32(s.n_expert_used as usize)?;
+                            let mut reads = Vec::with_capacity(3 * pred.len());
+                            for &e in &pred {
+                                if e < 0 || e as u32 >= s.n_expert {
+                                    continue;
+                                }
+                                for t in next_exps {
+                                    let offset = t.abs_offset + e as u64 * t.expert_bytes;
+                                    if !st.store.contains(offset)
+                                        && !st.dev_cache.map.contains_key(&offset)
+                                    {
+                                        reads.push(stream::Read { offset, len: t.expert_bytes });
+                                    }
+                                }
+                            }
+                            if !reads.is_empty() {
+                                let _ = st.prefetcher.req_tx.send(reads);
+                            }
+                        }
+                        // absorb whatever the prefetcher finished
+                        while let Ok((off, slab)) = st.prefetcher.done_rx.try_recv() {
+                            st.store.absorb(off, slab);
+                        }
                         debug_assert_eq!(up_exps.expert_bytes, gate_exps.expert_bytes);
                         debug_assert_eq!(down_exps.expert_bytes, gate_exps.expert_bytes);
                         let mut distinct: Vec<i32> = selected
