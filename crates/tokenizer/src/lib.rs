@@ -48,6 +48,7 @@ enum Pre {
     JoyAi,
     /// ChatGLM4/GLM llama3-style split ("glm4").
     Glm4,
+    KimiK2,
 }
 
 /// The special-token ids a chat loop needs, resolved from the vocab.
@@ -141,6 +142,7 @@ impl Tokenizer {
             eot_id: id_key("tokenizer.ggml.eot_token_id"),
             pre: match g.metadata.get("tokenizer.ggml.pre").and_then(Value::as_str) {
                 Some("glm4") => Pre::Glm4,
+                Some("kimi-k2") => Pre::KimiK2,
                 _ => Pre::JoyAi,
             },
         })
@@ -168,6 +170,7 @@ impl Tokenizer {
         let pieces = match self.pre {
             Pre::JoyAi => pretokenize(text.as_bytes()),
             Pre::Glm4 => pretokenize_glm4(text.as_bytes()),
+            Pre::KimiK2 => pretokenize_kimi_k2(text.as_bytes()),
         };
         for piece in pieces {
             self.bpe_piece(piece, &mut out);
@@ -486,6 +489,164 @@ fn ascii_lower(cp: u32) -> u32 {
     }
 }
 
+
+/// Han (CJK ideograph) check for the kimi-k2 split (llama.cpp
+/// unicode_cpt_is_han ranges).
+fn kimi_is_han(cp: u32) -> bool {
+    matches!(cp,
+        0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0xF900..=0xFAFF
+        | 0x20000..=0x2A6DF | 0x2A700..=0x2B73F | 0x2B740..=0x2B81F
+        | 0x2B820..=0x2CEAF | 0x2F800..=0x2FA1F)
+}
+
+/// kimi-k2 pre-tokenizer (K2 regex via llama.cpp's custom handler):
+/// Han runs split alone; letter runs EXCLUDE Han, may take one leading
+/// non-letter/non-number char and attach an English contraction; the
+/// digit/punct/whitespace tail matches glm4 exactly.
+fn pretokenize_kimi_k2(s: &[u8]) -> Vec<&[u8]> {
+    let len = s.len();
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+
+    while pos < len {
+        let start = pos;
+        let cur = glm4_char_at(s, pos);
+        if !cur.valid {
+            break;
+        }
+
+        // Pattern 1: Han run
+        if kimi_is_han(cur.cp) {
+            pos = cur.next;
+            while pos < len {
+                let scan = glm4_char_at(s, pos);
+                if !scan.valid || !kimi_is_han(scan.cp) {
+                    break;
+                }
+                pos = scan.next;
+            }
+            out.push(&s[start..pos]);
+            continue;
+        }
+
+        // Patterns 2/3: letter run (non-Han), optional single leading
+        // non-letter/non-number/non-newline char, contraction attached
+        let cur_word_letter = cur.is_letter && !kimi_is_han(cur.cp);
+        let leading_ok = !(cur.cp == 0x0d || cur.cp == 0x0a || cur.is_letter || cur.is_number);
+        let next = glm4_char_at(s, cur.next);
+        let next_word_letter = next.valid && next.is_letter && !kimi_is_han(next.cp);
+        if cur_word_letter || (leading_ok && next_word_letter) {
+            pos = cur.next;
+            while pos < len {
+                let scan = glm4_char_at(s, pos);
+                if !scan.valid || !scan.is_letter || kimi_is_han(scan.cp) {
+                    break;
+                }
+                pos = scan.next;
+            }
+            // optional contraction: 's 't 'm 'd 're 've 'll
+            let ap = glm4_char_at(s, pos);
+            if ap.valid && ap.cp == 0x27 && ap.next < len {
+                let n1c = glm4_char_at(s, ap.next);
+                let n1 = ascii_lower(n1c.cp);
+                if matches!(n1, 0x73 | 0x74 | 0x6d | 0x64) {
+                    pos = n1c.next;
+                } else if n1c.valid && n1c.next < len {
+                    let n2c = glm4_char_at(s, n1c.next);
+                    let n2 = ascii_lower(n2c.cp);
+                    if (n1 == 0x72 && n2 == 0x65) || (n1 == 0x76 && n2 == 0x65) || (n1 == 0x6c && n2 == 0x6c) {
+                        pos = n2c.next;
+                    }
+                }
+            }
+            out.push(&s[start..pos]);
+            continue;
+        }
+
+        // digits, max 3
+        if cur.is_number {
+            let mut ndigits = 0;
+            while pos < len && ndigits < 3 {
+                let scan = glm4_char_at(s, pos);
+                if !scan.valid || !scan.is_number {
+                    break;
+                }
+                pos = scan.next;
+                ndigits += 1;
+            }
+            out.push(&s[start..pos]);
+            continue;
+        }
+
+        // punct/symbol run (optionally led by one space), trailing newlines
+        let (mut punct, punct_pos) = if cur.cp == 0x20 {
+            (glm4_char_at(s, cur.next), cur.next)
+        } else {
+            (cur, pos)
+        };
+        punct.valid = punct.valid && punct_pos < len;
+        if punct.valid && !punct.is_whitespace && !punct.is_letter && !punct.is_number {
+            pos = punct_pos;
+            while pos < len {
+                let scan = glm4_char_at(s, pos);
+                if !scan.valid || scan.is_whitespace || scan.is_letter || scan.is_number {
+                    break;
+                }
+                pos = scan.next;
+            }
+            while pos < len {
+                let scan = glm4_char_at(s, pos);
+                if !scan.valid || !(scan.cp == 0x0d || scan.cp == 0x0a) {
+                    break;
+                }
+                pos = scan.next;
+            }
+            out.push(&s[start..pos]);
+            continue;
+        }
+
+        // whitespace: same policy as glm4
+        if cur.is_whitespace {
+            pos = glm4_whitespace_segment(s, pos, len);
+            out.push(&s[start..pos]);
+            continue;
+        }
+
+        pos = cur.next;
+        out.push(&s[start..pos]);
+    }
+    out
+}
+
+
+/// glm4/kimi shared whitespace policy: keep the run through its last
+/// newline; otherwise leave the final ws char to join the next word.
+fn glm4_whitespace_segment(s: &[u8], pos: usize, len: usize) -> usize {
+    let mut p = pos;
+    let mut last_newline_end = 0usize;
+    let mut last_ws_start = pos;
+    let mut nspace = 0;
+    while p < len {
+        let scan = glm4_char_at(s, p);
+        if !scan.valid || !scan.is_whitespace {
+            break;
+        }
+        last_ws_start = p;
+        if scan.cp == 0x0d || scan.cp == 0x0a {
+            last_newline_end = scan.next;
+        }
+        p = scan.next;
+        nspace += 1;
+    }
+    if last_newline_end != 0 {
+        last_newline_end
+    } else if nspace > 1 && p < len {
+        last_ws_start
+    } else {
+        p
+    }
+}
+
 fn pretokenize_glm4(s: &[u8]) -> Vec<&[u8]> {
     let len = s.len();
     let mut out = Vec::new();
@@ -580,29 +741,7 @@ fn pretokenize_glm4(s: &[u8]) -> Vec<&[u8]> {
         // whitespace runs: keep through the last newline, or leave the
         // final ws char to join the next word
         if cur.is_whitespace {
-            let mut p = pos;
-            let mut last_newline_end = 0usize;
-            let mut last_ws_start = pos;
-            let mut nspace = 0;
-            while p < len {
-                let scan = glm4_char_at(s, p);
-                if !scan.valid || !scan.is_whitespace {
-                    break;
-                }
-                last_ws_start = p;
-                if scan.cp == 0x0d || scan.cp == 0x0a {
-                    last_newline_end = scan.next;
-                }
-                p = scan.next;
-                nspace += 1;
-            }
-            if last_newline_end != 0 {
-                pos = last_newline_end;
-            } else if nspace > 1 && p < len {
-                pos = last_ws_start;
-            } else {
-                pos = p;
-            }
+            pos = glm4_whitespace_segment(s, pos, len);
             out.push(&s[start..pos]);
             continue;
         }
@@ -619,6 +758,14 @@ fn pretokenize_glm4(s: &[u8]) -> Vec<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kimi_k2_han_runs_and_inline_contractions() {
+        let toks = pretokenize_kimi_k2("Hello\u{4f60}\u{597d}world don't 123".as_bytes());
+        let strs: Vec<&str> = toks.iter().map(|t| std::str::from_utf8(t).unwrap()).collect();
+        // Han run splits alone; contraction stays attached to its word
+        assert_eq!(strs, vec!["Hello", "\u{4f60}\u{597d}", "world", " don't", " ", "123"]);
+    }
 
     #[test]
     fn byte_char_map_is_a_bijection() {

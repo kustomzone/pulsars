@@ -775,11 +775,207 @@ mod real {
         }
     }
 
+    /// Host requant: dense K-quant tensors -> q8_0 at load. Kimi K2 (and
+    /// other community ggufs) put attention/embed/shexp weights in
+    /// q2_K..q6_K, which the dense fast paths don't read; q8_0 is a
+    /// superset precision-wise (the only loss is q8's own ~0.4% noise on
+    /// top of values already coarsened to 2-6 bits), so one-time host
+    /// conversion beats porting five dense matmul variants. Experts are
+    /// untouched (they stream from disk and have native kernels).
+    mod requant {
+        pub fn f16_to_f32(h: u16) -> f32 {
+            let s = ((h >> 15) & 1) as u32;
+            let e = ((h >> 10) & 0x1f) as u32;
+            let m = (h & 0x3ff) as u32;
+            let bits = if e == 0 {
+                if m == 0 { s << 31 } else {
+                    // subnormal
+                    let mut m = m;
+                    let mut e = 127 - 15 + 1;
+                    while m & 0x400 == 0 {
+                        m <<= 1;
+                        e -= 1;
+                    }
+                    (s << 31) | ((e as u32) << 23) | ((m & 0x3ff) << 13)
+                }
+            } else if e == 0x1f {
+                (s << 31) | (0xff << 23) | (m << 13)
+            } else {
+                (s << 31) | ((e + 127 - 15) << 23) | (m << 13)
+            };
+            f32::from_bits(bits)
+        }
+
+        fn f32_to_f16(x: f32) -> u16 {
+            let bits = x.to_bits();
+            let s = ((bits >> 16) & 0x8000) as u16;
+            let e = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+            let m = bits & 0x7f_ffff;
+            if e <= 0 {
+                s // flush to zero (scales here are never subnormal)
+            } else if e >= 0x1f {
+                s | 0x7c00
+            } else {
+                s | ((e as u16) << 10) | ((m >> 13) as u16)
+            }
+        }
+
+        fn k4_scale_min(j: usize, q: &[u8], d: &mut u8, m: &mut u8) {
+            if j < 4 {
+                *d = q[j] & 63;
+                *m = q[j + 4] & 63;
+            } else {
+                *d = (q[j + 4] & 0x0f) | ((q[j - 4] >> 6) << 4);
+                *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+            }
+        }
+
+        /// Dequantize one 256-element block of `ty` at `src` into `out`.
+        pub fn dequant_block(ty: gguf::TensorType, src: &[u8], out: &mut [f32; 256]) {
+            use gguf::TensorType as T;
+            match ty {
+                T::Q2K => {
+                    let (scales, qs) = (&src[0..16], &src[16..80]);
+                    let d = f16_to_f32(u16::from_le_bytes([src[80], src[81]]));
+                    let dmin = f16_to_f32(u16::from_le_bytes([src[82], src[83]]));
+                    let mut i = 0;
+                    for chunk in 0..2 {
+                        for shift in [0u8, 2, 4, 6] {
+                            let sub = i / 16;
+                            let _ = sub;
+                            for l in 0..32 {
+                                let j = i / 16; // 16-value scale group
+                                let sc = (scales[j] & 0x0f) as f32;
+                                let mn = (scales[j] >> 4) as f32;
+                                let q = ((qs[chunk * 32 + l] >> shift) & 3) as f32;
+                                out[i] = d * sc * q - dmin * mn;
+                                i += 1;
+                            }
+                        }
+                    }
+                }
+                T::Q3K => {
+                    let (hmask, qs, scales) = (&src[0..32], &src[32..96], &src[96..108]);
+                    let d = f16_to_f32(u16::from_le_bytes([src[108], src[109]]));
+                    let mut sc = [0i8; 16];
+                    for j in 0..16 {
+                        let s = if j < 8 {
+                            (scales[j] & 0x0f) | (((scales[8 + j % 4] >> (2 * (j / 4))) & 3) << 4)
+                        } else {
+                            (scales[j - 8] >> 4) | (((scales[8 + j % 4] >> (2 * (j / 4))) & 3) << 4)
+                        };
+                        sc[j] = s as i8 - 32;
+                    }
+                    let mut i = 0;
+                    let mut hbit = 1u8;
+                    for chunk in 0..2 {
+                        for shift in [0u8, 2, 4, 6] {
+                            for l in 0..32 {
+                                let mut q = ((qs[chunk * 32 + l] >> shift) & 3) as i32;
+                                if hmask[l] & hbit == 0 {
+                                    q -= 4;
+                                }
+                                out[i] = d * sc[i / 16] as f32 * q as f32;
+                                i += 1;
+                            }
+                            hbit <<= 1;
+                        }
+                    }
+                }
+                T::Q4K | T::Q5K => {
+                    let d = f16_to_f32(u16::from_le_bytes([src[0], src[1]]));
+                    let dmin = f16_to_f32(u16::from_le_bytes([src[2], src[3]]));
+                    let scales = &src[4..16];
+                    let (qh, qs) = if ty == T::Q5K {
+                        (&src[16..48], &src[48..176])
+                    } else {
+                        (&src[0..0], &src[16..144])
+                    };
+                    let mut i = 0;
+                    for j in 0..4 {
+                        let (mut s1, mut m1, mut s2, mut m2) = (0u8, 0u8, 0u8, 0u8);
+                        k4_scale_min(2 * j, scales, &mut s1, &mut m1);
+                        k4_scale_min(2 * j + 1, scales, &mut s2, &mut m2);
+                        for l in 0..32 {
+                            let mut q = (qs[j * 32 + l] & 0x0f) as f32;
+                            if ty == T::Q5K && qh[l] & (1 << (2 * j)) != 0 {
+                                q += 16.0;
+                            }
+                            out[i] = d * s1 as f32 * q - dmin * m1 as f32;
+                            i += 1;
+                        }
+                        for l in 0..32 {
+                            let mut q = (qs[j * 32 + l] >> 4) as f32;
+                            if ty == T::Q5K && qh[l] & (1 << (2 * j + 1)) != 0 {
+                                q += 16.0;
+                            }
+                            out[i] = d * s2 as f32 * q - dmin * m2 as f32;
+                            i += 1;
+                        }
+                    }
+                }
+                T::Q6K => {
+                    let (ql, qh, scales) = (&src[0..128], &src[128..192], &src[192..208]);
+                    let d = f16_to_f32(u16::from_le_bytes([src[208], src[209]]));
+                    let mut i = 0;
+                    for chunk in 0..2 {
+                        let (ql, qh) = (&ql[chunk * 64..], &qh[chunk * 32..]);
+                        let sc = &scales[chunk * 8..];
+                        for l in 0..32 {
+                            let q0 = ((ql[l] & 0x0f) as i32 | (((qh[l] >> 0) & 3) as i32) << 4) - 32;
+                            let q1 = ((ql[32 + l] & 0x0f) as i32 | (((qh[l] >> 2) & 3) as i32) << 4) - 32;
+                            let q2 = ((ql[l] >> 4) as i32 | (((qh[l] >> 4) & 3) as i32) << 4) - 32;
+                            let q3 = ((ql[32 + l] >> 4) as i32 | (((qh[l] >> 6) & 3) as i32) << 4) - 32;
+                            out[i + l] = d * sc[l / 16] as i8 as f32 * q0 as f32;
+                            out[i + 32 + l] = d * sc[2 + l / 16] as i8 as f32 * q1 as f32;
+                            out[i + 64 + l] = d * sc[4 + l / 16] as i8 as f32 * q2 as f32;
+                            out[i + 96 + l] = d * sc[6 + l / 16] as i8 as f32 * q3 as f32;
+                        }
+                        i += 128;
+                    }
+                }
+                _ => unreachable!("requant: unsupported type"),
+            }
+        }
+
+        /// f32 -> q8_0 (34-byte blocks of 32: f16 scale + int8 quants).
+        pub fn quantize_q8_0(x: &[f32], out: &mut Vec<u8>) {
+            for blk in x.chunks(32) {
+                let amax = blk.iter().fold(0f32, |a, &v| a.max(v.abs()));
+                let d = amax / 127.0;
+                let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+                out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+                for &v in blk {
+                    out.push((v * id).round().clamp(-128.0, 127.0) as i8 as u8);
+                }
+            }
+        }
+    }
+
     fn read_tensor_bytes(file: &File, g: &Gguf, name: &str) -> Result<Vec<u8>> {
         let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
         let bytes = t.byte_size().ok_or_else(|| meta_err(name))?;
         let mut buf = vec![0u8; bytes as usize];
         file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+
+        // dense K-quant tensors -> q8_0 (see mod requant). output.weight
+        // stays native: head_logits reads K-quants directly.
+        let convert = matches!(
+            t.ty,
+            TensorType::Q2K | TensorType::Q3K | TensorType::Q4K | TensorType::Q5K | TensorType::Q6K
+        ) && name != "output.weight";
+        if convert {
+            let n = t.n_elements() as usize;
+            let (block_elems, block_bytes) = t.ty.block_layout().ok_or_else(|| meta_err(name))?;
+            debug_assert_eq!(block_elems, 256);
+            let mut out = Vec::with_capacity(n / 32 * 34);
+            let mut f = [0f32; 256];
+            for b in 0..n / 256 {
+                requant::dequant_block(t.ty, &buf[b * block_bytes as usize..], &mut f);
+                requant::quantize_q8_0(&f, &mut out);
+            }
+            return Ok(out);
+        }
         Ok(buf)
     }
 
