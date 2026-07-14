@@ -100,8 +100,11 @@ mod real {
                 g.arch_meta(k).and_then(Value::as_f32).ok_or_else(|| meta_err(k))
             };
             let family = match g.architecture() {
-                Some("hy-v3") => Family::Gqa,
-                Some("glm-dsa") => Family::Mla,
+                // hyphen vs underscore: the original ds4-lineage ggufs say
+                // "hy-v3"; upstream llama.cpp (and AngelSlim's converter)
+                // write "hy_v3". Same model either way.
+                Some("hy-v3") | Some("hy_v3") => Family::Gqa,
+                Some("glm-dsa") | Some("glm_dsa") => Family::Mla,
                 other => return Err(format!("unsupported architecture {other:?}").into()),
             };
             let n_layer = u("block_count")?;
@@ -118,7 +121,15 @@ mod real {
                 head_dim: u("attention.key_length")?,
                 n_layer,
                 n_exec_layer: n_layer - nextn,
-                n_leading_dense: u("leading_dense_block_count")?,
+                // the ds4-lineage converter writes this KV; upstream
+                // llama.cpp (AngelSlim ggufs) omits it - infer it from
+                // where routed-expert tensors start
+                n_leading_dense: match u("leading_dense_block_count") {
+                    Ok(v) => v,
+                    Err(_) => (0..u("block_count")?)
+                        .find(|il| g.tensor(&format!("blk.{il}.ffn_gate_exps.weight")).is_some())
+                        .ok_or_else(|| meta_err("no MoE layers found"))?,
+                },
                 n_expert: u("expert_count")?,
                 n_expert_used: u("expert_used_count")?,
                 n_ff_exp: u("expert_feed_forward_length")?,
