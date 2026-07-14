@@ -1,4 +1,9 @@
-/* GQA full attention for Hy3-class models (hy_v3: 64 q heads / 8 kv heads,
+/* Ported verbatim from the NeutronStar fork of ds4
+ * (github.com/antirez/ds4), MIT License:
+ *   Copyright (c) 2026 The ds4.c authors
+ *   Copyright (c) 2023-2026 The ggml authors
+ *
+ * GQA full attention for Hy3-class models (hy_v3: 64 q heads / 8 kv heads,
  * head_dim 128, per-head QK-RMSNorm with weights, rotate-half RoPE).
  *
  * ds4's existing attention paths are all MLA-family (shared latent KV, no
