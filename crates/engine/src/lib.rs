@@ -251,6 +251,9 @@ mod real {
         /// PCIe link can still do: only activations cross per layer.
         pub attn_dev: Option<i32>,
         mtp: Option<MtpLayer>,
+        /// Draft-chain depth (PULSAR_MTP_DEPTH, default 3): tokens
+        /// speculated per round, verified together in one forward.
+        pub mtp_depth: u32,
     }
 
     /// v1 StreamingStore (DESIGN-expert-store.md): io_uring batch fetch of
@@ -942,6 +945,19 @@ mod real {
             } else {
                 None
             };
+            // depth default 1: the shipped nextn block is trained to
+            // predict ONE step from a true hidden; self-fed chaining is
+            // out-of-distribution and acceptance collapses with depth
+            // (Hy3 measured 30% -> 23% -> 10% at depths 1/3/5)
+            let mtp_depth = if mtp.is_some() {
+                std::env::var("PULSAR_MTP_DEPTH")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(1)
+                    .clamp(1, 8)
+            } else {
+                0
+            };
 
             Ok(Model {
                 path: path.to_path_buf(),
@@ -953,6 +969,7 @@ mod real {
                 layers,
                 attn_dev,
                 mtp,
+                mtp_depth,
             })
         }
     }
@@ -1115,6 +1132,10 @@ mod real {
         mtp_h: DeviceBuf,
         mtp_x: DeviceBuf,
         mtp_hidden: DeviceBuf,
+        /// true-hidden anchor saved across a draft chain (the chain
+        /// self-feeds approximate hiddens into mtp_hidden; the batched
+        /// fill pass afterwards needs the pre-chain value back)
+        mtp_hidden_save: DeviceBuf,
         pub mtp_drafted: u64,
         pub mtp_accepted: u64,
     }
@@ -1314,7 +1335,8 @@ mod real {
                 ctx,
                 max_batch: mb,
                 tok: DeviceBuf::alloc(mb as usize * 4)?,
-                last_row: f32s(2 * s.n_embd)?, // 2 rows: spec verify reads draft + successor
+                // spec verify reads depth+1 trailing rows
+                last_row: f32s((m.mtp_depth + 1).max(2) * s.n_embd)?,
                 cur: f32s(mb * s.n_embd)?,
                 normed: f32s(mb * s.n_embd)?,
                 q,
@@ -1363,7 +1385,7 @@ mod real {
                 )?,
                 kcache,
                 vcache,
-                logits: f32s(2 * s.n_vocab)?,
+                logits: f32s((m.mtp_depth + 1).max(2) * s.n_vocab)?,
                 store: StreamingStore::open(&m.path, cache_bytes)?,
                 prefetcher: Prefetcher::spawn(&m.path)?,
                 pred_logits: f32s(s.n_expert)?,
@@ -1401,6 +1423,7 @@ mod real {
                     b.write(0, &z)?;
                     b
                 },
+                mtp_hidden_save: f32s(if m.mtp.is_some() { s.n_embd } else { 1 })?,
                 mtp_drafted: 0,
                 mtp_accepted: 0,
             };
@@ -1919,13 +1942,6 @@ mod real {
             self.eval_layer(st, self.layers.len(), &mtp.layer, n_tok, pos0, primary)
         }
 
-        /// Cache-fill MTP pass: same as mtp_draft minus the output head
-        /// (used on accept to keep the block's KV contiguous - the draft
-        /// itself is not needed, so skip the lm-head matmul + readback).
-        fn mtp_fill(&self, st: &mut State, token: u32, pos: u32) -> Result {
-            self.mtp_body(st, token, pos)
-        }
-
         /// One MTP pass: embed `token` at `pos` against st.mtp_hidden,
         /// append the block's KV, return the greedy draft for pos+1.
         /// Clobbers st.cur.
@@ -1986,9 +2002,11 @@ mod real {
         if spec {
             let v = model.shape.n_vocab as usize;
             let row = model.shape.n_embd as usize * 4;
+            let depth_max = model.mtp_depth.max(1);
+            let debug = std::env::var_os("PULSAR_MTP_DEBUG").is_some();
             let mut emitted = 0usize;
             let mut next = argmax(logits.as_deref().ok_or("no logits")?);
-            while emitted < max_tokens {
+            'round: while emitted < max_tokens {
                 if stop(next) || pos + 2 >= st.ctx() {
                     model.forward_batch(st, &[next], pos, false)?;
                     pos += 1;
@@ -1996,47 +2014,59 @@ mod real {
                 }
                 on_token(next);
                 emitted += 1;
-                // draft from the MTP block, then verify [next, draft] in
-                // ONE forward: the per-layer union expert fetch makes the
-                // second row nearly free. Greedy acceptance keeps the
-                // output stream identical to plain greedy decode.
-                let d = model.mtp_draft(st, next, pos)?;
-                st.mtp_drafted += 1;
-                let both = model
-                    .forward_rows(st, &[next, d], pos, 2)?
-                    .ok_or("no verify logits")?;
-                let t_true = argmax(&both[..v]);
-                if std::env::var_os("PULSAR_MTP_DEBUG").is_some() {
-                    let nan0 = both[..v].iter().filter(|x| !x.is_finite()).count();
-                    let nan1 = both[v..].iter().filter(|x| !x.is_finite()).count();
-                    eprintln!(
-                        "mtp: pos={pos} next={next} d={d} t_true={t_true} accept={} nan0={nan0} nan1={nan1}",
-                        t_true == d
-                    );
-                }
-                // last_row holds the verify rows' raw hiddens and is not
-                // touched by mtp_draft - the stash that survives the fill
-                if t_true == d {
-                    st.mtp_accepted += 1;
-                    // fill the MTP cache row for d (embed d with h(next)),
-                    // then point the next draft at h(d)
-                    kernels::copy_d2d(&mut st.mtp_hidden, 0, &st.last_row, 0, row)?;
-                    model.mtp_fill(st, d, pos + 1)?;
-                    kernels::copy_d2d(&mut st.mtp_hidden, 0, &st.last_row, row, row)?;
-                    pos += 2;
+
+                // Draft a chain: each step self-feeds the MTP layer's own
+                // output hidden (approximate but cheap - one layer/step).
+                // Anchor the true pre-chain hidden for the fill pass.
+                kernels::copy_d2d(&mut st.mtp_hidden_save, 0, &st.mtp_hidden, 0, row)?;
+                let depth = depth_max.min(st.ctx() - pos - 2);
+                let mut chain = vec![next];
+                for i in 0..depth {
+                    let d = model.mtp_draft(st, chain[i as usize], pos + i)?;
+                    st.mtp_drafted += 1;
+                    kernels::copy_d2d(&mut st.mtp_hidden, 0, &st.cur, 0, row)?;
+                    chain.push(d);
                     if stop(d) {
-                        break; // forwarded, not emitted - same as non-spec
+                        break; // no point speculating past a stop token
+                    }
+                }
+                let k = chain.len() - 1; // drafts in flight
+
+                // Verify the whole chain in ONE forward: the per-layer
+                // union expert fetch is what makes the extra rows cheap.
+                // Greedy acceptance keeps the stream identical to plain
+                // greedy decode.
+                let all = model
+                    .forward_rows(st, &chain, pos, (k + 1) as u32)?
+                    .ok_or("no verify logits")?;
+                let mut j = 0usize;
+                while j < k && argmax(&all[j * v..(j + 1) * v]) == chain[j + 1] {
+                    st.mtp_accepted += 1;
+                    j += 1;
+                }
+                if debug {
+                    let nans = all.iter().filter(|x| !x.is_finite()).count();
+                    eprintln!("mtp: pos={pos} chain={chain:?} accepted={j}/{k} nan={nans}");
+                }
+
+                // Re-anchor the MTP cache on TRUE hiddens for the accepted
+                // prefix in one batched pass: st.tok still holds the chain,
+                // st.cur its verified hiddens - exactly what a prefill
+                // chunk looks like to mtp_prefill_fill.
+                kernels::copy_d2d(&mut st.mtp_hidden, 0, &st.mtp_hidden_save, 0, row)?;
+                model.mtp_prefill_fill(st, (j + 1) as u32, pos)?;
+                pos += (j + 1) as u32;
+                next = argmax(&all[j * v..(j + 1) * v]);
+
+                for &d in &chain[1..=j] {
+                    if stop(d) {
+                        break 'round; // forwarded, not emitted - as non-spec
                     }
                     if emitted >= max_tokens {
-                        break;
+                        break 'round;
                     }
                     on_token(d);
                     emitted += 1;
-                    next = argmax(&both[v..]);
-                } else {
-                    kernels::copy_d2d(&mut st.mtp_hidden, 0, &st.last_row, 0, row)?;
-                    pos += 1;
-                    next = t_true;
                 }
             }
             return Ok(pos);
