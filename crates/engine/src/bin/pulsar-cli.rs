@@ -347,8 +347,16 @@ fn run() -> engine::Result {
     }
     st.save_warm(&model)?;
     let dt = t2.elapsed().as_secs_f32();
+    let tier_note = {
+        let hits: u64 = st.tiers.iter().map(|t| t.hits).sum();
+        if hits > 0 {
+            format!(", tier {hits} resident slots")
+        } else {
+            String::new()
+        }
+    };
     eprintln!(
-        "pulsar: {} tokens in {:.2}s ({:.2} tok/s), vram cache {:.0}% hits, host cache {:.0}% of remainder\npulsar: ids {generated:?}",
+        "pulsar: {} tokens in {:.2}s ({:.2} tok/s), vram cache {:.0}% hits, host cache {:.0}% of remainder{tier_note}\npulsar: ids {generated:?}",
         generated.len(),
         dt,
         generated.len() as f32 / dt.max(1e-6),

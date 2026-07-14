@@ -134,20 +134,52 @@ mod real {
     const ATTR_CC_MAJOR: i32 = 75;
     const ATTR_CC_MINOR: i32 = 76;
 
-    /// Pick the GPU once, before the first allocation.
+    /// Raw probe used during device selection (must not route through
+    /// set_device - Once re-entrancy). Best-of-3 pinned 64MB H2D, GB/s.
+    fn raw_h2d_probe(dev: i32) -> f64 {
+        const MB64: usize = 64 << 20;
+        if unsafe { cudaSetDevice(dev) } != 0 {
+            return 0.0;
+        }
+        let mut host = std::ptr::null_mut();
+        let mut dst = std::ptr::null_mut();
+        if unsafe { cudaHostAlloc(&mut host, MB64, 0) } != 0 {
+            return 0.0;
+        }
+        if unsafe { cudaMalloc(&mut dst, MB64) } != 0 {
+            unsafe { cudaFreeHost(host) };
+            return 0.0;
+        }
+        let mut best = 0f64;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            if unsafe { cudaMemcpy(dst, host, MB64, H2D) } == 0 {
+                best = best.max(MB64 as f64 / 1e9 / t.elapsed().as_secs_f64());
+            }
+        }
+        unsafe {
+            cudaFree(dst);
+            cudaFreeHost(host);
+        }
+        best
+    }
+
+    /// Pick the primary GPU once, before the first allocation.
     ///
     /// CUDA's default device is index 0 under its own "fastest first" ordering,
-    /// which is NOT PCI bus order and does not agree with nvidia-smi. On a mixed
-    /// box it can hand us the wrong card: substrate ranks an Ada 4060 Ti ahead of
-    /// a Blackwell 5060 Ti, and the 4060 Ti sits on a PCIe x1 link (0.8 GB/s vs
-    /// 28.8 GB/s). Expert streaming is H2D-bound, so accepting the default costs
-    /// ~36x. Choose the highest compute capability; PULSAR_GPU overrides with a
-    /// CUDA device index.
+    /// which is NOT PCI bus order and does not agree with nvidia-smi. Worse,
+    /// static rankings lie about what matters: expert streaming is H2D-bound,
+    /// and substrate's 4060 Ti sits in a slot that trains PCIe x1 (0.8 GB/s vs
+    /// the 5060 Ti's 28.8) - a compute-capability heuristic can't see that, and
+    /// neither can lspci at idle. So MEASURE: probe H2D bandwidth per device
+    /// and take the fastest link (~100ms/device at startup, tie-break by
+    /// compute capability). PULSAR_GPU overrides with a CUDA device index.
     fn ensure_device() {
         use std::sync::Once;
         static ONCE: Once = Once::new();
         ONCE.call_once(|| {
             let pick = std::env::var("PULSAR_GPU").ok().and_then(|s| s.trim().parse::<i32>().ok());
+            let mut probed = 0.0;
             let dev = pick.unwrap_or_else(|| {
                 let mut n = 0;
                 if unsafe { cudaGetDeviceCount(&mut n) } != 0 || n <= 1 {
@@ -161,12 +193,26 @@ mod real {
                     }
                     maj * 10 + min
                 };
-                (0..n).max_by_key(|&d| (cc(d), -d)).unwrap_or(0)
+                let best = (0..n)
+                    .map(|d| (d, raw_h2d_probe(d)))
+                    .max_by(|a, b| {
+                        a.1.partial_cmp(&b.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| cc(a.0).cmp(&cc(b.0)))
+                            .then_with(|| b.0.cmp(&a.0))
+                    })
+                    .unwrap_or((0, 0.0));
+                probed = best.1;
+                best.0
             });
             if unsafe { cudaSetDevice(dev) } != 0 {
                 eprintln!("pulsar: cudaSetDevice({dev}) failed, falling back to CUDA default");
             } else if std::env::var_os("PULSAR_QUIET").is_none() {
-                eprintln!("pulsar: using CUDA device {dev}");
+                if probed > 0.0 {
+                    eprintln!("pulsar: using CUDA device {dev} ({probed:.1} GB/s H2D measured)");
+                } else {
+                    eprintln!("pulsar: using CUDA device {dev}");
+                }
             }
         });
     }
@@ -189,6 +235,37 @@ mod real {
         let mut n = 0;
         unsafe { cudaGetDeviceCount(&mut n) };
         n
+    }
+
+    /// Measured H2D bandwidth to `dev` in GB/s (pinned 64MB, best of 3).
+    /// Labels lie - a Gen5 card can train at Gen1, an x8 slot can run x1 -
+    /// so role assignment trusts measurements only. Restores the device.
+    pub fn h2d_bandwidth(dev: i32) -> Result<f64> {
+        const MB64: usize = 64 << 20;
+        let cur = get_device();
+        set_device(dev)?;
+        let mut host = std::ptr::null_mut();
+        let mut dst = std::ptr::null_mut();
+        check_rt(unsafe { cudaHostAlloc(&mut host, MB64, 0) }, "probe host alloc")?;
+        if let Err(e) = check_rt(unsafe { cudaMalloc(&mut dst, MB64) }, "probe dev alloc") {
+            unsafe { cudaFreeHost(host) };
+            set_device(cur)?;
+            return Err(e);
+        }
+        let mut best = 0f64;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let r = unsafe { cudaMemcpy(dst, host, MB64, H2D) };
+            if r == 0 {
+                best = best.max(MB64 as f64 / 1e9 / t.elapsed().as_secs_f64());
+            }
+        }
+        unsafe {
+            cudaFree(dst);
+            cudaFreeHost(host);
+        }
+        set_device(cur)?;
+        Ok(best)
     }
 
     /// (free, total) VRAM in bytes on `dev`. Restores the current device.
@@ -503,6 +580,12 @@ mod real {
 
     pub fn add(out: &mut DeviceBuf, a: &DeviceBuf, b: &DeviceBuf, n: u32) -> Result {
         check(unsafe { pulsar_add(out.ptr_mut(), a.ptr(), b.ptr(), n) }, "add")
+    }
+
+    /// out += b (elementwise kernel; aliasing out as input is safe).
+    pub fn add_assign(out: &mut DeviceBuf, b: &DeviceBuf, n: u32) -> Result {
+        let o = out.ptr_mut();
+        check(unsafe { pulsar_add(o, o as *const c_void, b.ptr(), n) }, "add_assign")
     }
 
     #[allow(clippy::too_many_arguments)]

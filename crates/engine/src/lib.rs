@@ -385,6 +385,45 @@ mod real {
         }
     }
 
+    /// Static resident expert tier on a leftover GPU: the hottest expert
+    /// TRIPLES (gate+up+down must colocate - the mid activations never
+    /// leave the card) parked permanently in that card's VRAM, placed by
+    /// warm-census heat at load. The MoE kernels run on the card that
+    /// holds the weights and only activations cross PCIe, so - like attn
+    /// residency - a bandwidth-crippled link serves a tier at full speed.
+    /// No eviction: a tier is placement, not a cache.
+    pub struct ExpertTier {
+        dev: i32,
+        pool: DeviceBuf,
+        /// slab file offset -> pool ptr (all 3 slabs of a triple present)
+        map: std::collections::HashMap<u64, *const std::ffi::c_void>,
+        // per-card scratch, sized like the primary's
+        xin: DeviceBuf,
+        xq: DeviceBuf,
+        mid: DeviceBuf,
+        midq: DeviceBuf,
+        out: DeviceBuf,
+        ptrs: DeviceBuf,
+        weights: DeviceBuf,
+        pub hits: u64,
+    }
+
+    unsafe impl Send for ExpertTier {}
+
+    fn read_census(path: &Path) -> Vec<(u64, u64, u64)> {
+        let Ok(bytes) = std::fs::read(warm_path(path)) else {
+            return Vec::new();
+        };
+        let mut entries = Vec::with_capacity(bytes.len() / 24);
+        for c in bytes.chunks_exact(24) {
+            let off = u64::from_le_bytes(c[0..8].try_into().unwrap());
+            let len = u64::from_le_bytes(c[8..16].try_into().unwrap());
+            let count = u64::from_le_bytes(c[16..24].try_into().unwrap());
+            entries.push((off, len, count));
+        }
+        entries
+    }
+
     /// Device-side expert slab cache: a uniform-slot VRAM pool holding a
     /// STABLE hot set. The pool is smaller than one token's slab working
     /// set, so plain LFU would evict everything every token; instead every
@@ -874,6 +913,101 @@ mod real {
         }
     }
 
+    /// Fill leftover GPUs (not primary, not the attn card) with the
+    /// hottest expert triples from the warm census. First run has no
+    /// census, so tiers activate from the second run on.
+    fn build_tiers(m: &Model, mb: u32, primary: i32) -> Result<Vec<ExpertTier>> {
+        let s = m.shape;
+        if std::env::var("PULSAR_TIERS").ok().as_deref() == Some("off") {
+            return Ok(Vec::new());
+        }
+        let candidates: Vec<i32> = (0..kernels::device_count())
+            .filter(|&d| d != primary && Some(d) != m.attn_dev)
+            .collect();
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let census: std::collections::HashMap<u64, u64> =
+            read_census(&m.path).into_iter().map(|(off, _, count)| (off, count)).collect();
+        if census.is_empty() {
+            eprintln!("pulsar: no warm census yet - expert tiers idle until the next run");
+            return Ok(Vec::new());
+        }
+        // rank whole triples by summed slab heat
+        let mut triples: Vec<(u64, [ (u64, u64); 3 ])> = Vec::new();
+        for l in &m.layers {
+            let Ffn::Moe { gate_exps, up_exps, down_exps, .. } = &l.ffn else {
+                continue;
+            };
+            for e in 0..s.n_expert as u64 {
+                let slabs = [gate_exps, up_exps, down_exps]
+                    .map(|t| (t.abs_offset + e * t.expert_bytes, t.expert_bytes));
+                let heat: u64 = slabs.iter().filter_map(|(off, _)| census.get(off)).sum();
+                if heat > 0 {
+                    triples.push((heat, slabs));
+                }
+            }
+        }
+        triples.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+
+        let file = File::open(&m.path)?;
+        let mut tiers = Vec::new();
+        let mut next = triples.into_iter();
+        for d in candidates {
+            let Ok((free, _)) = kernels::mem_info(d) else { continue };
+            let reserve: usize = 1 << 30; // scratch + CUDA context
+            if free <= reserve + (1 << 30) {
+                continue; // not worth a tier
+            }
+            let t0 = std::time::Instant::now();
+            kernels::set_device(d)?;
+            let n_used = s.n_expert_used as usize;
+            let mut tier = ExpertTier {
+                dev: d,
+                pool: DeviceBuf::alloc(free - reserve)?,
+                map: std::collections::HashMap::new(),
+                xin: DeviceBuf::alloc(mb as usize * s.n_embd as usize * 4)?,
+                xq: DeviceBuf::alloc(
+                    mb as usize * s.n_embd as usize / kernels::Q8_K_BLOCK_ELEMS
+                        * kernels::Q8_K_BLOCK_BYTES,
+                )?,
+                mid: DeviceBuf::alloc(mb as usize * n_used * s.n_ff_exp as usize * 4)?,
+                midq: DeviceBuf::alloc(
+                    mb as usize * n_used * s.n_ff_exp as usize / kernels::Q8_K_BLOCK_ELEMS
+                        * kernels::Q8_K_BLOCK_BYTES,
+                )?,
+                out: DeviceBuf::alloc(mb as usize * s.n_embd as usize * 4)?,
+                ptrs: DeviceBuf::alloc(mb as usize * n_used * std::mem::size_of::<ExpertPtrs>())?,
+                weights: DeviceBuf::alloc(mb as usize * n_used * 4)?,
+                hits: 0,
+            };
+            let mut cursor = 0usize;
+            let mut slab_buf = Vec::new();
+            for (_, slabs) in next.by_ref() {
+                let need: usize = slabs.iter().map(|&(_, len)| len as usize).sum();
+                if cursor + need > tier.pool.bytes() {
+                    break;
+                }
+                for (off, len) in slabs {
+                    slab_buf.resize(len as usize, 0);
+                    file.read_exact_at(&mut slab_buf, off)?;
+                    tier.pool.write(cursor, &slab_buf)?;
+                    tier.map.insert(off, tier.pool.ptr_at(cursor));
+                    cursor += len as usize;
+                }
+            }
+            kernels::set_device(primary)?;
+            eprintln!(
+                "pulsar: expert tier on CUDA device {d}: {} triples ({:.1}GB) resident in {:.1}s",
+                tier.map.len() / 3,
+                cursor as f64 / 1e9,
+                t0.elapsed().as_secs_f32()
+            );
+            tiers.push(tier);
+        }
+        Ok(tiers)
+    }
+
     /// Per-decode device state: activation buffers, KV caches, the routed
     /// expert staging arena, and reusable host staging.
     pub struct State {
@@ -926,6 +1060,10 @@ mod real {
         // copied primary->attn GPU, attn output copied back
         normed_a: DeviceBuf,
         attn_out_a: DeviceBuf,
+        // resident expert tiers on leftover GPUs + the primary-side
+        // buffer their partial outputs are gathered into
+        pub tiers: Vec<ExpertTier>,
+        tier_ret: DeviceBuf,
     }
 
     impl State {
@@ -980,6 +1118,11 @@ mod real {
                 let count = u64::from_le_bytes(c[16..24].try_into().unwrap());
                 entries.push((off, len, count));
             }
+            // tier-resident slabs never reach the caches - don't preload them
+            let in_tier =
+                |off: u64| self.tiers.iter().any(|t| t.map.contains_key(&off));
+            let entries: Vec<_> =
+                entries.into_iter().filter(|&(off, _, _)| !in_tier(off)).collect();
             for &(off, len, count) in &entries {
                 self.dev_cache.touch.insert(off, (count, len));
             }
@@ -1081,6 +1224,7 @@ mod real {
             if m.attn_dev.is_some() {
                 kernels::set_device(primary)?;
             }
+            let tiers = build_tiers(m, mb, primary)?;
             let mut st = State {
                 ctx,
                 max_batch: mb,
@@ -1158,6 +1302,8 @@ mod real {
                 mla_selected,
                 normed_a,
                 attn_out_a,
+                tier_ret: if tiers.is_empty() { f32s(1)? } else { f32s(mb * s.n_embd)? },
+                tiers,
             };
             let t0 = std::time::Instant::now();
             let warmed = st.load_warm(m)?;
@@ -1379,6 +1525,7 @@ mod real {
                                     let offset = t.abs_offset + e as u64 * t.expert_bytes;
                                     if !st.store.contains(offset)
                                         && !st.dev_cache.map.contains_key(&offset)
+                                        && !st.tiers.iter().any(|tr| tr.map.contains_key(&offset))
                                     {
                                         reads.push(stream::Read { offset, len: t.expert_bytes });
                                     }
@@ -1405,6 +1552,7 @@ mod real {
                                         let offset = t.abs_offset + e * t.expert_bytes;
                                         if !st.store.contains(offset)
                                             && !st.dev_cache.map.contains_key(&offset)
+                                            && !st.tiers.iter().any(|tr| tr.map.contains_key(&offset))
                                         {
                                             reads.push(stream::Read {
                                                 offset,
@@ -1431,9 +1579,31 @@ mod real {
                             .collect();
                         distinct.sort_unstable();
                         distinct.dedup();
+                        // resident-tier experts compute on their own card;
+                        // they are never fetched, cached, or staged here
+                        let tier_of = |e: i32| -> Option<(usize, ExpertPtrs)> {
+                            let g = gate_exps.abs_offset + e as u64 * gate_exps.expert_bytes;
+                            st.tiers.iter().enumerate().find_map(|(ti, t)| {
+                                let gate = *t.map.get(&g)?;
+                                Some((ti, ExpertPtrs {
+                                    gate,
+                                    up: *t.map.get(&(up_exps.abs_offset + e as u64 * up_exps.expert_bytes))?,
+                                    down: *t.map.get(&(down_exps.abs_offset + e as u64 * down_exps.expert_bytes))?,
+                                }))
+                            })
+                        };
                         let mut offsets =
                             Vec::with_capacity(3 * distinct.len());
                         for &e in &distinct {
+                            if tier_of(e).is_some() {
+                                // keep the census warm for resident slabs
+                                // or their heat freezes at placement time
+                                for t in [gate_exps, up_exps, down_exps] {
+                                    let off = t.abs_offset + e as u64 * t.expert_bytes;
+                                    st.dev_cache.touch.entry(off).or_insert((0, t.expert_bytes)).0 += 1;
+                                }
+                                continue;
+                            }
                             for t in [gate_exps, up_exps, down_exps] {
                                 offsets.push(stream::Read {
                                     offset: t.abs_offset + e as u64 * t.expert_bytes,
@@ -1477,9 +1647,21 @@ mod real {
                         })?;
                         st.prof.h2d += h2d;
                         let mut ptrs = Vec::with_capacity(selected.len());
-                        for &e in &selected {
+                        let mut tptrs: Vec<Vec<ExpertPtrs>> = st
+                            .tiers
+                            .iter()
+                            .map(|_| vec![ExpertPtrs::NULL; selected.len()])
+                            .collect();
+                        let mut tier_slots = vec![0u64; st.tiers.len()];
+                        for (si, &e) in selected.iter().enumerate() {
                             if e < 0 || e as u32 >= s.n_expert {
                                 ptrs.push(ExpertPtrs::NULL);
+                                continue;
+                            }
+                            if let Some((ti, tp)) = tier_of(e) {
+                                ptrs.push(ExpertPtrs::NULL);
+                                tptrs[ti][si] = tp;
+                                tier_slots[ti] += 1;
                                 continue;
                             }
                             let p = |t: &ExpertTensor| {
@@ -1495,6 +1677,33 @@ mod real {
                         st.prof.resolve += t_resolve.elapsed();
                         st.prof.calls += 1;
 
+                        // tier partials first: their kernels run on other
+                        // cards, overlapping the primary's MoE below
+                        let mut active = Vec::new();
+                        for ti in 0..st.tiers.len() {
+                            if tier_slots[ti] == 0 {
+                                continue;
+                            }
+                            let tier = &mut st.tiers[ti];
+                            tier.hits += tier_slots[ti];
+                            kernels::copy_across(&mut tier.xin, &st.normed, (n_tok * s.n_embd) as usize * 4)?;
+                            kernels::copy_across(&mut tier.weights, &st.router_weights, (n_tok * s.n_expert_used) as usize * 4)?;
+                            kernels::set_device(tier.dev)?;
+                            tier.ptrs.write(0, kernels::as_bytes(&tptrs[ti]))?;
+                            kernels::quantize_q8_k(&mut tier.xq, &tier.xin, s.n_embd, n_tok)?;
+                            kernels::moe_pair_swiglu(
+                                &mut tier.mid, &tier.ptrs, &tier.weights, &tier.xq,
+                                s.n_embd, s.n_ff_exp, s.n_expert_used, n_tok, gate_exps.row_bytes, gate_exps.quant,
+                            )?;
+                            kernels::quantize_q8_k(&mut tier.midq, &tier.mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
+                            kernels::moe_down(
+                                &mut tier.out, &tier.ptrs, &tier.midq,
+                                s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
+                            )?;
+                            kernels::set_device(primary)?;
+                            active.push(ti);
+                        }
+
                         // routed experts: activations quantized to q8_K,
                         // integer dp4a dots (ds4's exact math)
                         kernels::moe_pair_swiglu(
@@ -1506,6 +1715,19 @@ mod real {
                             &mut st.moe_out, &st.expert_ptrs, &st.midq,
                             s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, down_exps.row_bytes, down_exps.quant,
                         )?;
+
+                        // gather tier partials (blocking copy issued on the
+                        // tier's device = ordered after its kernels).
+                        // NOTE: summing partials reorders float adds vs the
+                        // single-kernel slot loop - same drift class as
+                        // batch-vs-decode; PULSAR_TIERS=off restores exact.
+                        for ti in active {
+                            let tier = &st.tiers[ti];
+                            kernels::set_device(tier.dev)?;
+                            kernels::copy_across(&mut st.tier_ret, &tier.out, (n_tok * s.n_embd) as usize * 4)?;
+                            kernels::set_device(primary)?;
+                            kernels::add_assign(&mut st.moe_out, &st.tier_ret, n_tok * s.n_embd)?;
+                        }
 
                         // cur = after_attn + routed + shared (ds4's add3)
                         kernels::add(&mut st.ffn_out, &st.moe_out, &st.shared_out, n_tok * s.n_embd)?;
