@@ -215,6 +215,9 @@ mod real {
                 TensorType::Q5K => kernels::QUANT_Q5_K,
                 TensorType::Q6K => kernels::QUANT_Q6_K,
                 TensorType::Q3K => kernels::QUANT_Q3_K,
+                TensorType::IQ2XS => kernels::QUANT_IQ2_XS,
+                TensorType::IQ3XXS => kernels::QUANT_IQ3_XXS,
+                TensorType::Q4_0 => kernels::QUANT_Q4_0,
                 other => return Err(format!("{}: unsupported expert type {other:?}", t.name).into()),
             };
             let row_elems = t.dims[0];
