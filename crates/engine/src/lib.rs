@@ -53,6 +53,9 @@ mod real {
         pub n_ff_dense: u32,
         pub n_vocab: u32,
         pub expert_weight_scale: f32,
+        /// qwen3moe: softmax router, no bias, normalize top-k probs.
+        /// false = sigmoid router (Hy3/GLM/DeepSeek/MiniMax lineage).
+        pub router_softmax: bool,
         pub rope_freq_base: f32,
         pub rms_eps: f32,
         // MLA only (zero for Gqa)
@@ -133,6 +136,9 @@ mod real {
                 // MiniMax M3: Hy3-shaped GQA MoE (shexp, sigmoid router)
                 // with partial rotary (rope.dimension_count < head_dim)
                 Some("minimax-m3") | Some("minimax-m2") => Family::Gqa,
+                // Qwen3 MoE (235B-A22B / 30B-A3B): GQA + per-head qk norm,
+                // softmax router, no shared expert, no leading dense
+                Some("qwen3moe") => Family::Gqa,
                 Some("glm-dsa") | Some("glm_dsa") => Family::Mla,
                 // DeepSeek-V3 family (Kimi K2 etc.): plain MLA, no indexer
                 Some("deepseek2") => Family::Mla,
@@ -166,7 +172,9 @@ mod real {
                 n_ff_exp: u("expert_feed_forward_length")?,
                 n_ff_dense: u("feed_forward_length")?,
                 n_vocab,
-                expert_weight_scale: f("expert_weights_scale")?,
+                // absent on qwen3moe (no scaling) - default 1.0
+                expert_weight_scale: f("expert_weights_scale").unwrap_or(1.0),
+                router_softmax: g.architecture() == Some("qwen3moe"),
                 rope_freq_base: f("rope.freq_base")?,
                 rms_eps: f("attention.layer_norm_rms_epsilon")?,
                 n_lora_q: 0,
@@ -256,9 +264,8 @@ mod real {
         Moe {
             gate_inp: DeviceBuf,
             probs_b: DeviceBuf,
-            shexp_gate: DeviceBuf,
-            shexp_up: DeviceBuf,
-            shexp_down: DeviceBuf,
+            /// shared expert; None on qwen3moe (routed experts only)
+            shexp: Option<(DeviceBuf, DeviceBuf, DeviceBuf)>,
             gate_exps: ExpertTensor,
             up_exps: ExpertTensor,
             down_exps: ExpertTensor,
@@ -1226,10 +1233,23 @@ mod real {
                     };
                     Ffn::Moe {
                         gate_inp: upload(&file, &gguf, &t("ffn_gate_inp.weight"))?,
-                        probs_b: upload(&file, &gguf, &probs_b_name)?,
-                        shexp_gate: upload(&file, &gguf, &t("ffn_gate_shexp.weight"))?,
-                        shexp_up: upload(&file, &gguf, &t("ffn_up_shexp.weight"))?,
-                        shexp_down: upload(&file, &gguf, &t("ffn_down_shexp.weight"))?,
+                        // no bias tensor (qwen3moe) -> zeros: score = prob
+                        probs_b: if gguf.tensor(&probs_b_name).is_some() {
+                            upload(&file, &gguf, &probs_b_name)?
+                        } else {
+                            let mut z = DeviceBuf::alloc(shape.n_expert as usize * 4)?;
+                            kernels::zero(&mut z)?;
+                            z
+                        },
+                        shexp: if gguf.tensor(&t("ffn_gate_shexp.weight")).is_some() {
+                            Some((
+                                upload(&file, &gguf, &t("ffn_gate_shexp.weight"))?,
+                                upload(&file, &gguf, &t("ffn_up_shexp.weight"))?,
+                                upload(&file, &gguf, &t("ffn_down_shexp.weight"))?,
+                            ))
+                        } else {
+                            None
+                        },
                         gate_exps: exps("ffn_gate_exps.weight")?,
                         up_exps: exps("ffn_up_exps.weight")?,
                         down_exps: exps("ffn_down_exps.weight")?,
@@ -2174,7 +2194,7 @@ mod real {
                         kernels::matmul_q8_0(&mut st.ffn_out, down, &st.ffn_mid, s.n_ff_dense, s.n_embd, n_tok)?;
                         kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, n_tok * s.n_embd)?;
                     }
-                    Ffn::Moe { gate_inp, probs_b, shexp_gate, shexp_up, shexp_down, gate_exps, up_exps, down_exps } => {
+                    Ffn::Moe { gate_inp, probs_b, shexp, gate_exps, up_exps, down_exps } => {
                         kernels::matmul_f32(&mut st.router_logits, gate_inp, &st.normed, s.n_embd, s.n_expert, n_tok)?;
                         kernels::router_select(
                             &mut st.router_selected,
@@ -2185,6 +2205,7 @@ mod real {
                             s.n_expert_used,
                             s.expert_weight_scale,
                             n_tok,
+                            s.router_softmax,
                         )?;
 
                         // Cross-layer prefetch (decode only): run the NEXT
@@ -2214,16 +2235,21 @@ mod real {
                                 s.n_expert_used,
                                 s.expert_weight_scale,
                                 1,
+                                s.router_softmax,
                             )?;
                         }
 
                         // shared expert: depends only on normed, so it is
                         // launched BEFORE the resolve - the GPU computes it
                         // under the disk/H2D wait
-                        kernels::matmul_q8_0(&mut st.gate_act, shexp_gate, &st.normed, s.n_embd, s.n_ff_exp, n_tok)?;
-                        kernels::matmul_q8_0(&mut st.up_act, shexp_up, &st.normed, s.n_embd, s.n_ff_exp, n_tok)?;
-                        kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, n_tok * s.n_ff_exp, 0.0, 1.0)?;
-                        kernels::matmul_q8_0(&mut st.shared_out, shexp_down, &st.ffn_mid, s.n_ff_exp, s.n_embd, n_tok)?;
+                        if let Some((sg, su, sd)) = shexp {
+                            kernels::matmul_q8_0(&mut st.gate_act, sg, &st.normed, s.n_embd, s.n_ff_exp, n_tok)?;
+                            kernels::matmul_q8_0(&mut st.up_act, su, &st.normed, s.n_embd, s.n_ff_exp, n_tok)?;
+                            kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, n_tok * s.n_ff_exp, 0.0, 1.0)?;
+                            kernels::matmul_q8_0(&mut st.shared_out, sd, &st.ffn_mid, s.n_ff_exp, s.n_embd, n_tok)?;
+                        } else {
+                            kernels::zero(&mut st.shared_out, (n_tok * s.n_embd) as usize * 4)?;
+                        }
                         // also quantize the routed-expert activations now;
                         // only the expert weights are still in flight
                         kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, n_tok)?;

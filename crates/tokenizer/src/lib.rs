@@ -50,6 +50,9 @@ enum Pre {
     Glm4,
     KimiK2,
     MiniMax,
+    /// Qwen2/Qwen3 split ("qwen2"): minimax minus its extras; standalone
+    /// contractions, single-digit numbers.
+    Qwen2,
 }
 
 /// The special-token ids a chat loop needs, resolved from the vocab.
@@ -62,11 +65,14 @@ enum ChatStyle {
     Hy3,
     /// <|im_user|>user<|im_middle|>text<|im_end|> ... (Kimi K2 family)
     Kimi,
+    /// <|im_start|>user\ntext<|im_end|>\n ... (Qwen ChatML; no bos)
+    ChatMl,
 }
 
 pub struct ChatMarkers {
     style: ChatStyle,
-    pub bos: u32,
+    /// None on ChatML models (qwen: add_bos_token=false, no bos id).
+    pub bos: Option<u32>,
     pub eos: u32,
     pub eot: Option<u32>,
     user: u32,
@@ -82,7 +88,7 @@ impl ChatMarkers {
         if t.find_token("<|im_middle|>").is_some() {
             return Ok(ChatMarkers {
                 style: ChatStyle::Kimi,
-                bos: t.bos_id.ok_or(Error::MissingKey("bos_token_id"))?,
+                bos: Some(t.bos_id.ok_or(Error::MissingKey("bos_token_id"))?),
                 eos: t.eos_id.ok_or(Error::MissingKey("eos_token_id"))?,
                 eot: t.find_token("<|im_end|>"),
                 user: find("<|im_user|>")?,
@@ -91,9 +97,22 @@ impl ChatMarkers {
                 aux1: find("<|im_system|>")?,
             });
         }
+        if t.find_token("<|im_start|>").is_some() {
+            // Qwen ChatML: <|im_start|> opens every turn, <|im_end|> closes
+            return Ok(ChatMarkers {
+                style: ChatStyle::ChatMl,
+                bos: t.bos_id,
+                eos: t.eos_id.ok_or(Error::MissingKey("eos_token_id"))?,
+                eot: t.find_token("<|im_end|>"),
+                user: find("<|im_start|>")?,
+                assistant: find("<|im_start|>")?,
+                aux0: find("<|im_end|>")?,
+                aux1: find("<|im_end|>")?,
+            });
+        }
         Ok(ChatMarkers {
             style: ChatStyle::Hy3,
-            bos: t.bos_id.ok_or(Error::MissingKey("bos_token_id"))?,
+            bos: Some(t.bos_id.ok_or(Error::MissingKey("bos_token_id"))?),
             eos: t.eos_id.ok_or(Error::MissingKey("eos_token_id"))?,
             eot: t.eot_id,
             user: find("<｜hy_User:opensource｜>")?,
@@ -107,6 +126,13 @@ impl ChatMarkers {
     pub fn render_system(&self, t: &Tokenizer, text: &str) -> Vec<u32> {
         match self.style {
             ChatStyle::Hy3 => t.encode(text),
+            ChatStyle::ChatMl => {
+                let mut v = vec![self.user];
+                v.extend(t.encode(&format!("system\n{text}")));
+                v.push(self.aux0);
+                v.extend(t.encode("\n"));
+                v
+            }
             ChatStyle::Kimi => {
                 let mut v = vec![self.aux1];
                 v.extend(t.encode("system"));
@@ -134,6 +160,13 @@ impl ChatMarkers {
                 v.extend(self.eot);
                 v
             }
+            ChatStyle::ChatMl => {
+                let mut v = vec![self.user];
+                v.extend(t.encode(&format!("user\n{text}")));
+                v.push(self.aux0);
+                v.extend(t.encode("\n"));
+                v
+            }
         }
     }
 
@@ -149,6 +182,11 @@ impl ChatMarkers {
                 v.extend(t.encode("<think></think>"));
                 v
             }
+            ChatStyle::ChatMl => {
+                let mut v = vec![self.assistant];
+                v.extend(t.encode("assistant\n"));
+                v
+            }
         }
     }
 
@@ -157,6 +195,9 @@ impl ChatMarkers {
         let mut v = self.open_assistant(t);
         v.extend(t.encode(text));
         v.push(self.eot.unwrap_or(self.eos));
+        if self.style == ChatStyle::ChatMl {
+            v.extend(t.encode("\n"));
+        }
         v
     }
 
@@ -231,6 +272,7 @@ impl Tokenizer {
                 Some("glm4") => Pre::Glm4,
                 Some("kimi-k2") => Pre::KimiK2,
                 Some("minimax-m2") => Pre::MiniMax,
+                Some("qwen2") => Pre::Qwen2,
                 _ => Pre::JoyAi,
             },
         })
@@ -260,6 +302,7 @@ impl Tokenizer {
             Pre::Glm4 => pretokenize_glm4(text.as_bytes()),
             Pre::KimiK2 => pretokenize_kimi_k2(text.as_bytes()),
             Pre::MiniMax => pretokenize_minimax(text.as_bytes()),
+            Pre::Qwen2 => pretokenize_qwen2(text.as_bytes()),
         };
         for piece in pieces {
             self.bpe_piece(piece, &mut out);
@@ -684,6 +727,97 @@ fn pretokenize_minimax(s: &[u8]) -> Vec<&[u8]> {
     out
 }
 
+/// qwen2 pre-tokenizer (llama.cpp LLAMA_VOCAB_PRE_TYPE_QWEN2 regex):
+/// like minimax WITHOUT its extras, plus gpt2-style ordering: an English
+/// contraction at the cursor is its own token (checked before the letter
+/// run, never absorbed into it), digits split one per token, punct runs
+/// absorb trailing newlines only.
+fn pretokenize_qwen2(s: &[u8]) -> Vec<&[u8]> {
+    let len = s.len();
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < len {
+        let start = pos;
+        let cur = glm4_char_at(s, pos);
+        if !cur.valid {
+            break;
+        }
+        // contraction alternative comes FIRST in the qwen2 regex
+        if cur.cp == 0x27 && cur.next < len {
+            let n1c = glm4_char_at(s, cur.next);
+            let n1 = ascii_lower(n1c.cp);
+            let mut end = 0usize;
+            if matches!(n1, 0x73 | 0x74 | 0x6d | 0x64) {
+                end = n1c.next;
+            }
+            if n1c.valid && n1c.next < len {
+                let n2c = glm4_char_at(s, n1c.next);
+                let n2 = ascii_lower(n2c.cp);
+                if (n1 == 0x72 && n2 == 0x65) || (n1 == 0x76 && n2 == 0x65) || (n1 == 0x6c && n2 == 0x6c) {
+                    end = n2c.next;
+                }
+            }
+            if end > 0 {
+                pos = end;
+                out.push(&s[start..pos]);
+                continue;
+            }
+        }
+        let leading_ok = !(cur.cp == 0x0d || cur.cp == 0x0a || cur.is_letter || cur.is_number);
+        let next = glm4_char_at(s, cur.next);
+        if cur.is_letter || (leading_ok && next.valid && next.is_letter) {
+            pos = cur.next;
+            while pos < len {
+                let scan = glm4_char_at(s, pos);
+                if !scan.valid || !scan.is_letter {
+                    break;
+                }
+                pos = scan.next;
+            }
+            out.push(&s[start..pos]);
+            continue;
+        }
+        if cur.is_number {
+            pos = cur.next; // \p{N}: one digit per token
+            out.push(&s[start..pos]);
+            continue;
+        }
+        let (mut punct, punct_pos) = if cur.cp == 0x20 {
+            (glm4_char_at(s, cur.next), cur.next)
+        } else {
+            (cur, pos)
+        };
+        punct.valid = punct.valid && punct_pos < len;
+        if punct.valid && !punct.is_whitespace && !punct.is_letter && !punct.is_number {
+            pos = punct_pos;
+            while pos < len {
+                let scan = glm4_char_at(s, pos);
+                if !scan.valid || scan.is_whitespace || scan.is_letter || scan.is_number {
+                    break;
+                }
+                pos = scan.next;
+            }
+            while pos < len {
+                let scan = glm4_char_at(s, pos);
+                if !scan.valid || !(scan.cp == 0x0d || scan.cp == 0x0a) {
+                    break;
+                }
+                pos = scan.next;
+            }
+            out.push(&s[start..pos]);
+            continue;
+        }
+        if cur.is_whitespace {
+            pos = glm4_whitespace_segment(s, pos, len);
+            out.push(&s[start..pos]);
+            continue;
+        }
+        pos = cur.next;
+        out.push(&s[start..pos]);
+    }
+    out
+}
+
 fn pretokenize_kimi_k2(s: &[u8]) -> Vec<&[u8]> {
     let len = s.len();
     let mut out = Vec::new();
@@ -946,6 +1080,15 @@ mod tests {
         let strs: Vec<&str> = toks.iter().map(|t| std::str::from_utf8(t).unwrap()).collect();
         // Han run splits alone; contraction stays attached to its word
         assert_eq!(strs, vec!["Hello", "\u{4f60}\u{597d}", "world", " don't", " ", "123"]);
+    }
+
+    #[test]
+    fn qwen2_standalone_contractions_and_single_digits() {
+        let toks = pretokenize_qwen2(b"don't 12 x;\ny");
+        let strs: Vec<&str> = toks.iter().map(|b| std::str::from_utf8(b).unwrap()).collect();
+        // contraction is its OWN piece (gpt2 order), digits split singly,
+        // punct absorbs the newline
+        assert_eq!(strs, vec!["don", "'t", " ", "1", "2", " x", ";\n", "y"]);
     }
 
     #[test]

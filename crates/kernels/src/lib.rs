@@ -78,7 +78,7 @@ mod real {
         fn pulsar_idx_scores_batch(scores: *mut c_void, q: *const c_void, weights: *const c_void, cache: *const c_void, n_rows: u32, n_tokens: u32, pos0: u32, n_head: u32, head_dim: u32, scale: f32) -> i32;
         fn pulsar_swiglu(out: *mut c_void, gate: *const c_void, up: *const c_void, n: u32, clamp: f32, weight: f32) -> i32;
         fn pulsar_add(out: *mut c_void, a: *const c_void, b: *const c_void, n: u32) -> i32;
-        fn pulsar_router_select(selected: *mut c_void, weights: *mut c_void, logits: *const c_void, bias: *const c_void, n_expert: u32, k_used: u32, weight_scale: f32, n_tok: u32) -> i32;
+        fn pulsar_router_select(selected: *mut c_void, weights: *mut c_void, logits: *const c_void, bias: *const c_void, n_expert: u32, k_used: u32, weight_scale: f32, n_tok: u32, softmax_mode: u32) -> i32;
         fn pulsar_quantize_q8_K(out: *mut c_void, x: *const c_void, in_dim: u32, n_rows: u32) -> i32;
         fn pulsar_moe_pair_swiglu(mid: *mut c_void, ptrs: *const c_void, weights: *const c_void, x: *const c_void, in_dim: u32, mid_dim: u32, n_used: u32, n_tok: u32, row_bytes: u64, quant: u32) -> i32;
         fn pulsar_moe_down(out: *mut c_void, ptrs: *const c_void, mid: *const c_void, mid_dim: u32, out_dim: u32, n_used: u32, n_tok: u32, row_bytes: u64, quant: u32) -> i32;
@@ -686,10 +686,10 @@ mod real {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn router_select(selected: &mut DeviceBuf, weights: &mut DeviceBuf, logits: &DeviceBuf, bias: &DeviceBuf, n_expert: u32, k_used: u32, weight_scale: f32, n_tok: u32) -> Result {
+    pub fn router_select(selected: &mut DeviceBuf, weights: &mut DeviceBuf, logits: &DeviceBuf, bias: &DeviceBuf, n_expert: u32, k_used: u32, weight_scale: f32, n_tok: u32, softmax: bool) -> Result {
         check(
             unsafe {
-                pulsar_router_select(selected.ptr_mut(), weights.ptr_mut(), logits.ptr(), bias.ptr(), n_expert, k_used, weight_scale, n_tok)
+                pulsar_router_select(selected.ptr_mut(), weights.ptr_mut(), logits.ptr(), bias.ptr(), n_expert, k_used, weight_scale, n_tok, softmax as u32)
             },
             "router_select",
         )

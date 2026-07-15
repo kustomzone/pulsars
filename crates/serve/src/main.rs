@@ -157,7 +157,7 @@ fn encode_messages(
     m: &tokenizer::ChatMarkers,
     messages: &[serde_json::Value],
 ) -> Vec<u32> {
-    let mut ids = vec![m.bos];
+    let mut ids: Vec<u32> = m.bos.into_iter().collect();
     for msg in messages {
         let role = msg["role"].as_str().unwrap_or("");
         let content = msg["content"].as_str().unwrap_or("");

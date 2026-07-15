@@ -485,6 +485,10 @@ __device__ __forceinline__ static bool router_better(
     return av > bv || (av == bv && ai < bi);
 }
 
+/* softmax_mode (qwen3moe): softmax(logits) then renormalize over the
+ * selected k is algebraically softmax over just the selected logits, and
+ * softmax is monotonic so top-k by prob == top-k by logit. So: select on
+ * raw logits, then exp-normalize the k winners. */
 template <uint32_t J>
 __global__ static void router_select_kernel(
         int32_t *selected,         /* [n_tok][k_used] */
@@ -494,7 +498,8 @@ __global__ static void router_select_kernel(
         uint32_t n_expert,
         uint32_t k_used,
         float weight_scale,
-        uint32_t n_tok) {
+        uint32_t n_tok,
+        uint32_t softmax_mode) {
     const uint32_t lane = threadIdx.x;
     const uint32_t token = blockIdx.x * blockDim.y + threadIdx.y;
     if (token >= n_tok || lane >= 32u) return;
@@ -509,7 +514,7 @@ __global__ static void router_select_kernel(
     for (uint32_t j = 0; j < J; j++) {
         const uint32_t e = lane + j * 32u;
         if (e < n_expert) {
-            const float p = router_sigmoid(log[e]);
+            const float p = softmax_mode ? log[e] : router_sigmoid(log[e]);
             local_prob[j] = p;
             local_score[j] = p + bias[e];
         } else {
@@ -556,8 +561,19 @@ __global__ static void router_select_kernel(
     }
 
     if (lane == 0) {
-        sum = fmaxf(sum, 6.103515625e-5f);
-        for (uint32_t k = 0; k < k_used; k++) w[k] = w[k] / sum * weight_scale;
+        if (softmax_mode) {
+            float m = -INFINITY;
+            for (uint32_t k = 0; k < k_used; k++) m = fmaxf(m, w[k]);
+            float es = 0.0f;
+            for (uint32_t k = 0; k < k_used; k++) {
+                w[k] = expf(w[k] - m);
+                es += w[k];
+            }
+            for (uint32_t k = 0; k < k_used; k++) w[k] = w[k] / es * weight_scale;
+        } else {
+            sum = fmaxf(sum, 6.103515625e-5f);
+            for (uint32_t k = 0; k < k_used; k++) w[k] = w[k] / sum * weight_scale;
+        }
     }
 }
 
@@ -569,7 +585,8 @@ extern "C" int pulsar_router_select(
         uint32_t n_expert,
         uint32_t k_used,
         float weight_scale,
-        uint32_t n_tok) {
+        uint32_t n_tok,
+        uint32_t softmax_mode) {
     if (n_expert == 0 || n_expert > 512u || k_used == 0 || k_used > n_expert ||
         n_tok == 0) {
         return 0;
@@ -579,19 +596,22 @@ extern "C" int pulsar_router_select(
         router_select_kernel<16><<<(n_tok + 3u) / 4u, block>>>(
                 (int32_t *)selected_dev, (float *)weights_dev,
                 (const float *)logits_dev, (const float *)bias_dev,
-                n_expert, k_used, weight_scale, n_tok);
+                n_expert, k_used, weight_scale, n_tok, softmax_mode);
         return cuda_ok(cudaGetLastError(), "router select launch");
     }
     router_select_kernel<8><<<(n_tok + 3u) / 4u, block>>>(
             (int32_t *)selected_dev, (float *)weights_dev,
             (const float *)logits_dev, (const float *)bias_dev,
-            n_expert, k_used, weight_scale, n_tok);
+            n_expert, k_used, weight_scale, n_tok, softmax_mode);
     return cuda_ok(cudaGetLastError(), "router select launch");
 }
 
-/* CPU-reference selftest across Hy3-like and GLM-like shapes. */
+/* CPU-reference selftest across Hy3-like and GLM-like shapes. The softmax
+ * reference is the llama.cpp order (full softmax over ALL experts, top-k,
+ * renormalize the selected) - deliberately NOT the kernel's select-on-
+ * logits algebra, so this also proves the equivalence the kernel relies on. */
 static int router_selftest_one(uint32_t n_expert, uint32_t k_used,
-                               float scale, uint32_t n_tok) {
+                               float scale, uint32_t n_tok, uint32_t softmax) {
     float *logits = (float *)malloc((uint64_t)n_tok * n_expert * sizeof(float));
     float *bias = (float *)malloc((uint64_t)n_expert * sizeof(float));
     int32_t *sel_ref = (int32_t *)malloc((uint64_t)n_tok * k_used * sizeof(int32_t));
@@ -601,13 +621,20 @@ static int router_selftest_one(uint32_t n_expert, uint32_t k_used,
 
     for (uint64_t i = 0; i < (uint64_t)n_tok * n_expert; i++)
         logits[i] = gqa_test_randf() * 4.0f;
-    for (uint32_t e = 0; e < n_expert; e++) bias[e] = gqa_test_randf();
+    for (uint32_t e = 0; e < n_expert; e++)
+        bias[e] = softmax ? 0.0f : gqa_test_randf();
 
     for (uint32_t t = 0; t < n_tok; t++) {
         const float *log = logits + (uint64_t)t * n_expert;
-        float prob[256], score[256];
+        float prob[512], score[512];
+        float lmax = -INFINITY, lsum = 0.0f;
+        if (softmax) {
+            for (uint32_t e = 0; e < n_expert; e++) lmax = fmaxf(lmax, log[e]);
+            for (uint32_t e = 0; e < n_expert; e++) lsum += expf(log[e] - lmax);
+        }
         for (uint32_t e = 0; e < n_expert; e++) {
-            prob[e] = 1.0f / (1.0f + expf(-log[e]));
+            prob[e] = softmax ? expf(log[e] - lmax) / lsum
+                              : 1.0f / (1.0f + expf(-log[e]));
             score[e] = prob[e] + bias[e];
         }
         float sum = 0.0f;
@@ -639,7 +666,7 @@ static int router_selftest_one(uint32_t n_expert, uint32_t k_used,
              cuda_ok(cudaMemcpy(log_dev, logits, log_bytes, cudaMemcpyHostToDevice), "logits h2d") &&
              cuda_ok(cudaMemcpy(bias_dev, bias, bias_bytes, cudaMemcpyHostToDevice), "bias h2d") &&
              pulsar_router_select(sel_dev, w_dev, log_dev, bias_dev,
-                                  n_expert, k_used, scale, n_tok) &&
+                                  n_expert, k_used, scale, n_tok, softmax) &&
              cuda_ok(cudaDeviceSynchronize(), "sync") &&
              cuda_ok(cudaMemcpy(sel_gpu, sel_dev, sel_bytes, cudaMemcpyDeviceToHost), "sel d2h") &&
              cuda_ok(cudaMemcpy(w_gpu, w_dev, w_bytes, cudaMemcpyDeviceToHost), "w d2h");
@@ -654,8 +681,9 @@ static int router_selftest_one(uint32_t n_expert, uint32_t k_used,
         ok = idx_mismatch == 0 && maxd <= 1e-5f;
     }
     fprintf(stderr,
-            "router-selftest n_expert=%u k=%u: %s (idx mismatches %u, max w diff %.2e)\n",
-            n_expert, k_used, ok ? "PASS" : "FAIL", idx_mismatch, (double)maxd);
+            "router-selftest n_expert=%u k=%u%s: %s (idx mismatches %u, max w diff %.2e)\n",
+            n_expert, k_used, softmax ? " softmax" : "",
+            ok ? "PASS" : "FAIL", idx_mismatch, (double)maxd);
     if (log_dev) cudaFree(log_dev);
     if (bias_dev) cudaFree(bias_dev);
     if (sel_dev) cudaFree(sel_dev);
@@ -665,10 +693,13 @@ static int router_selftest_one(uint32_t n_expert, uint32_t k_used,
 }
 
 extern "C" int pulsar_router_selftest(void) {
-    /* Hy3-like (64 experts, top-8), GLM-like (256, top-8), odd token count */
-    return router_selftest_one(64, 8, 2.5f, 7) &&
-           router_selftest_one(256, 8, 1.0f, 5) &&
-           router_selftest_one(96, 6, 1.5f, 1);
+    /* Hy3-like (64 experts, top-8), GLM-like (256, top-8), odd token
+     * count; qwen3moe-like softmax (128, top-8) + wide softmax (384) */
+    return router_selftest_one(64, 8, 2.5f, 7, 0) &&
+           router_selftest_one(256, 8, 1.0f, 5, 0) &&
+           router_selftest_one(96, 6, 1.5f, 1, 0) &&
+           router_selftest_one(128, 8, 1.0f, 6, 1) &&
+           router_selftest_one(384, 8, 1.0f, 3, 1);
 }
 
 /* ---- routed-expert MoE: IQ2_XXS / Q2_K dequant-dot kernels -------------
