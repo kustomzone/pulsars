@@ -26,14 +26,17 @@ sliding-window attention, dual GELU FFN). Reference box: RTX 5060 Ti
 | Kimi K2.7-Code 1T (339GB, 8-shard split gguf) | **1.3 tok/s** | – |
 | Hy3 295B (85GB gguf) | **7.2 tok/s** | 0.64–0.70 (ds4) |
 | GLM-5.2 743B (197GB gguf) | **2.0 tok/s** | 0.40 (ds4) |
-| Hy3 long-prompt prefill | **28 tok/s** (tensor cores) | 0.44 (ds4) |
+| Hy3 long-prompt prefill | **28 tok/s** (tensor cores, 1.8×) | 0.44 (ds4) |
+| GLM-5.2 long-prompt prefill | **15 tok/s** (tensor cores, 2.7×) | – |
 | warm start | hot experts bulk-load in **~3s** | – |
 
 Prefill runs the quantized weights through int8 tensor cores on
 sm_80+ (`mma.m16n8k32` dense GEMM + mmq-style grouped MoE that unpacks
 each expert superblock to shared memory once per prefill chunk and
-rescales per quant block in registers) — 1.8× over the dp4a kernels,
-which remain the path on older GPUs.
+rescales per quant block in registers) — 1.8–2.7× over the dp4a
+kernels, which remain the path on older GPUs. Decode is single-token
+and memory-bound, so it is deliberately untouched: ids stay
+bit-identical to the dp4a path.
 
 GLM runs contexts past its naive 2048-row ceiling via a port of the
 DSA lightning indexer (top-k row selection per token), validated
