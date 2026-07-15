@@ -81,6 +81,7 @@ mod real {
         fn pulsar_idx_scores_batch(scores: *mut c_void, q: *const c_void, weights: *const c_void, cache: *const c_void, n_rows: u32, n_tokens: u32, pos0: u32, n_head: u32, head_dim: u32, scale: f32) -> i32;
         fn pulsar_swiglu(out: *mut c_void, gate: *const c_void, up: *const c_void, n: u32, clamp: f32, weight: f32, act_op: u32) -> i32;
         fn pulsar_scale(x: *mut c_void, n: u32, c: f32) -> i32;
+        fn pulsar_fill_row_tail(x: *mut c_void, rows: u32, row_w: u32, keep: u32, v: f32) -> i32;
         fn pulsar_softcap(x: *mut c_void, n: u32, cap: f32) -> i32;
         fn pulsar_router_scale_selected(w: *mut c_void, sel: *const c_void, scale: *const c_void, n: u32, n_expert: u32) -> i32;
         fn pulsar_add(out: *mut c_void, a: *const c_void, b: *const c_void, n: u32) -> i32;
@@ -672,6 +673,12 @@ mod real {
 
     pub fn scale(x: &mut DeviceBuf, n: u32, c: f32) -> Result {
         check(unsafe { pulsar_scale(x.ptr_mut(), n, c) }, "scale")
+    }
+
+    /// Fill columns keep..row_w of each row with v (inkling padded-vocab
+    /// logit poison).
+    pub fn fill_row_tail(x: &mut DeviceBuf, rows: u32, row_w: u32, keep: u32, v: f32) -> Result {
+        check(unsafe { pulsar_fill_row_tail(x.ptr_mut(), rows, row_w, keep, v) }, "fill_row_tail")
     }
 
     pub fn softcap(x: &mut DeviceBuf, n: u32, cap: f32) -> Result {

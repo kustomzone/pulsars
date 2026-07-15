@@ -80,6 +80,11 @@ enum ChatStyle {
     /// ]~b]user\ntext[e~[ ... (MiniMax M3; roles are "user"/"ai" plain
     /// text after the ]~b] marker; ]~!b[ opens the conversation)
     MiniMax,
+    /// <|message_user|><|content_text|>text<|end_message|> ... (TML
+    /// Inkling; assistant opener is a bare <|message_model|> - the model
+    /// picks <|content_thinking|>/<|content_text|> itself and stops at
+    /// <|content_model_end_sampling|>)
+    Inkling,
 }
 
 pub struct ChatMarkers {
@@ -120,6 +125,20 @@ impl ChatMarkers {
                 assistant: find("<start_of_turn>")?,
                 aux0: find("<end_of_turn>")?,
                 aux1: find("<end_of_turn>")?,
+            });
+        }
+        if t.find_token("<|message_user|>").is_some() {
+            // TML Inkling: <|message_<role>|><|content_text|>text
+            // <|end_message|>; generation stops at the sampling marker
+            return Ok(ChatMarkers {
+                style: ChatStyle::Inkling,
+                bos: None, // add_bos_token = 0
+                eos: t.eos_id.ok_or(Error::MissingKey("eos_token_id"))?,
+                eot: t.find_token("<|content_model_end_sampling|>"),
+                user: find("<|message_user|>")?,
+                assistant: find("<|message_model|>")?,
+                aux0: find("<|end_message|>")?,
+                aux1: find("<|content_text|>")?,
             });
         }
         if t.find_token("]~b]").is_some() {
@@ -200,6 +219,15 @@ impl ChatMarkers {
                 v.extend(t.encode("\n"));
                 v
             }
+            ChatStyle::Inkling => {
+                // <|message_system|> is per-render (fixed marker fields
+                // only cover user/assistant)
+                let sys = t.find_token("<|message_system|>").unwrap_or(self.user);
+                let mut v = vec![sys, self.aux1];
+                v.extend(t.encode(text));
+                v.push(self.aux0);
+                v
+            }
         }
     }
 
@@ -233,6 +261,12 @@ impl ChatMarkers {
                 v.extend(t.encode("\n"));
                 v
             }
+            ChatStyle::Inkling => {
+                let mut v = vec![self.user, self.aux1];
+                v.extend(t.encode(text));
+                v.push(self.aux0);
+                v
+            }
         }
     }
 
@@ -264,11 +298,21 @@ impl ChatMarkers {
                 v.push(self.aux1); // <mm:think>: thinking-enabled prefix
                 v
             }
+            // bare <|message_model|>: the model emits its own content-
+            // kind marker (thinking or text)
+            ChatStyle::Inkling => vec![self.assistant],
         }
     }
 
     /// A completed assistant turn from history (opener + content + stop).
     pub fn render_assistant_history(&self, t: &Tokenizer, text: &str) -> Vec<u32> {
+        if self.style == ChatStyle::Inkling {
+            // history closes with <|end_message|>, not the sampling stop
+            let mut v = vec![self.assistant, self.aux1];
+            v.extend(t.encode(text));
+            v.push(self.aux0);
+            return v;
+        }
         let mut v = self.open_assistant(t);
         v.extend(t.encode(text));
         v.push(self.eot.unwrap_or(self.eos));
@@ -359,6 +403,10 @@ impl Tokenizer {
                     Some("glm4") => Pre::Glm4,
                     Some("kimi-k2") => Pre::KimiK2,
                     Some("minimax-m2") => Pre::MiniMax,
+                    // inkling = the same o200k-family regex with \p{M}
+                    // added to the letter classes (combining marks join
+                    // letter runs); identical on ASCII/precomposed text
+                    Some("inkling") => Pre::MiniMax,
                     Some("qwen2") => Pre::Qwen2,
                     _ => Pre::JoyAi,
                 }

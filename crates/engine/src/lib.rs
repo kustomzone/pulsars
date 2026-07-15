@@ -77,6 +77,15 @@ mod real {
         // YaRN (deepseek2/Kimi: factor 32, log_mult 0.1; GLM ships 1.0/off)
         pub rope_scale_factor: f32,
         pub rope_yarn_log_mult: f32,
+        // Inkling (zero elsewhere). n_shexp_sink shared experts ride the
+        // router as always-selected slots: n_expert_used INCLUDES them
+        // (gguf expert_used_count + n_shexp_sink), expert ids >= n_expert
+        // resolve into the shexp bank.
+        pub n_shexp_sink: u32,
+        pub d_rel: u32,
+        pub rel_ext: u32,
+        pub rel_ext_swa: u32,
+        pub sconv_k: u32,
     }
 
     impl Shape {
@@ -157,8 +166,12 @@ mod real {
                 Some("glm-dsa") | Some("glm_dsa") => Family::Mla,
                 // DeepSeek-V3 family (Kimi K2 etc.): plain MLA, no indexer
                 Some("deepseek2") => Family::Mla,
+                // TML Inkling 1T: GQA without rope (learned rel-pos bias),
+                // shortconv streams, sink router (llama.cpp PR 25731)
+                Some("inkling") => Family::Gqa,
                 other => return Err(format!("unsupported architecture {other:?}").into()),
             };
+            let inkling = g.architecture() == Some("inkling");
             let n_layer = u("block_count")?;
             let nextn = u("nextn_predict_layers").unwrap_or(0);
             let n_vocab = match g.metadata.get("tokenizer.ggml.tokens") {
@@ -207,13 +220,18 @@ mod real {
                 router_softmax: matches!(g.architecture(), Some("qwen3moe") | Some("gemma4")),
                 // gated-FFN op: 1 = gelu (gemma4), 2 = swiglu_oai (MiniMax
                 // M3: clamp 7, alpha 1.702, up+1 - llama.cpp PR 24523),
-                // 0 = plain silu everywhere else
+                // 0 = plain silu everywhere else (inkling included)
                 moe_act_op: match g.architecture() {
                     Some("gemma4") => 1,
                     Some("minimax-m3") => 2,
                     _ => 0,
                 },
-                rope_freq_base: f("rope.freq_base")?,
+                // inkling has no rope at all - the key may be absent
+                rope_freq_base: if inkling {
+                    f("rope.freq_base").unwrap_or(10_000.0)
+                } else {
+                    f("rope.freq_base")?
+                },
                 rms_eps: f("attention.layer_norm_rms_epsilon")?,
                 n_lora_q: 0,
                 n_kv_lora: 0,
@@ -227,11 +245,26 @@ mod real {
                 n_idx_topk: 0,
                 rope_scale_factor: 1.0,
                 rope_yarn_log_mult: 0.0,
+                n_shexp_sink: 0,
+                d_rel: 0,
+                rel_ext: 0,
+                rel_ext_swa: 0,
+                sconv_k: 0,
             };
             if family == Family::Gqa {
                 // partial rotary: MiniMax rotates rope.dimension_count of
                 // head_dim; absent (Hy3) = full head
                 s.rot_dim = u("rope.dimension_count").unwrap_or(s.head_dim);
+            }
+            if inkling {
+                s.rot_dim = 0; // no rope: rel-pos bias carries position
+                s.n_shexp_sink = u("expert_shared_count")?;
+                // shared experts execute as always-selected router slots
+                s.n_expert_used += s.n_shexp_sink;
+                s.d_rel = u("d_rel")?;
+                s.rel_ext = u("rel_extent")?;
+                s.rel_ext_swa = u("rel_extent_swa")?;
+                s.sconv_k = u("shortconv_kernel")?;
             }
             if family == Family::Mla {
                 // GLM-5.2 MLA split from the gguf's own keys (verified
@@ -330,6 +363,11 @@ mod real {
             /// per-expert output scale [n_expert] (gemma4 down_exps.scale),
             /// folded into the route weights after selection
             down_scale: Option<DeviceBuf>,
+            /// inkling shexp bank [gate, up, down] as n_shexp_sink-wide
+            /// ExpertTensors: router slots with ids >= n_expert resolve
+            /// here, so the offset-keyed cache/census/tier machinery
+            /// serves shared experts like any other slab
+            sink: Option<[ExpertTensor; 3]>,
         },
     }
 
@@ -344,6 +382,26 @@ mod real {
         post_ffw_norm_2: DeviceBuf,
         post_ffw_norm: DeviceBuf,
         out_scale: f32,
+    }
+
+    /// Inkling per-layer weights (llama.cpp PR 25731): relative-position
+    /// attention bias + four shortconv streams + the ffn global scale.
+    struct InkW {
+        /// attn_r projection (q8_0 matmul, n_embd -> n_head * d_rel)
+        wr: DeviceBuf,
+        /// rel_proj TRANSPOSED at load to [rel_extent][d_rel] row-major
+        /// (gguf stores ne = [rel_extent, d_rel])
+        rel_proj: DeviceBuf,
+        /// this layer's band: rel_ext_swa on window layers, rel_ext global
+        rel_extent: u32,
+        /// f32 [w][K] depthwise kernels, tap K-1 = current token
+        sconv_k: DeviceBuf,
+        sconv_v: DeviceBuf,
+        sconv_attn: DeviceBuf,
+        sconv_mlp: DeviceBuf,
+        /// ffn_gscale scalar: scales dense ffn output / folds into the
+        /// route-weight scale for MoE layers
+        gscale: f32,
     }
 
     /// Per-layer attention geometry (gemma4 interleaved SWA/full); empty
@@ -401,6 +459,7 @@ mod real {
         ffn_norm: DeviceBuf,
         ffn: Ffn,
         gemma: Option<GemmaW>,
+        ink: Option<InkW>,
     }
 
     /// The nextn/MTP draft block: predicts token t+2 from (hidden of
@@ -452,6 +511,13 @@ mod real {
         embd_scale: f32,
         /// final-logit softcap (gemma: 30.0); 0 = off
         logit_softcap: f32,
+        /// post-embed rms norm weight (inkling token_embd_norm)
+        tok_norm: Option<DeviceBuf>,
+        /// final-logit multiplier (inkling muP: 1/logit_scale_denom); 1 = off
+        logit_scale: f32,
+        /// argmax/sampling cap (inkling pads the vocab: rows past
+        /// unpadded_vocab_size are garbage); == n_vocab when unpadded
+        pub n_vocab_out: u32,
     }
 
     /// v1 StreamingStore (DESIGN-expert-store.md): io_uring batch fetch of
@@ -1312,9 +1378,48 @@ mod real {
             // GPU the whole stack (~14GB q8) goes resident by default -
             // pinned overflow would be read over that card's own link.
             let gemma_arch = gguf.architecture() == Some("gemma4");
+            let ink_arch = gguf.architecture() == Some("inkling");
             // per-layer attention geometry: gemma4 interleaves sliding-
             // window layers (own kv width, head_dim, theta) with full ones
-            let geom: Vec<Geom> = if gemma_arch {
+            let geom: Vec<Geom> = if ink_arch {
+                // inkling: 55/66 layers at window 512 with their own kv
+                // width; no rope, so theta/factors are dead fields
+                let kvh: Vec<u64> = match gguf.arch_meta("attention.head_count_kv") {
+                    Some(Value::Array(a)) => a.iter().filter_map(Value::as_u64).collect(),
+                    Some(v) => v.as_u64().map(|x| vec![x]).unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                let swa_pat: Vec<bool> = match gguf.arch_meta("attention.sliding_window_pattern") {
+                    Some(Value::Array(a)) => a
+                        .iter()
+                        .map(|v| match v {
+                            Value::Bool(b) => *b,
+                            other => other.as_u64().unwrap_or(0) != 0,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let window = gguf
+                    .arch_meta("attention.sliding_window")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(512) as u32;
+                (0..shape.n_exec_layer as usize)
+                    .map(|il| {
+                        let swa = swa_pat.get(il).copied().unwrap_or(false);
+                        Geom {
+                            n_head_kv: kvh
+                                .get(il)
+                                .copied()
+                                .unwrap_or(shape.n_head_kv as u64)
+                                as u32,
+                            head_dim: shape.head_dim,
+                            theta: 0.0,
+                            window: if swa { window } else { 0 },
+                            factors: false,
+                        }
+                    })
+                    .collect()
+            } else if gemma_arch {
                 let arr_u = |k: &str| -> Vec<u64> {
                     match gguf.arch_meta(k) {
                         Some(Value::Array(a)) => a.iter().filter_map(Value::as_u64).collect(),
@@ -1392,6 +1497,13 @@ mod real {
                         let ti = gguf.tensor(&name).ok_or_else(|| meta_err(&name))?;
                         ExpertTensor::new(&gguf, ti, shape.n_expert)
                     };
+                    // inkling shexp bank: same shape as routed experts but
+                    // n_shexp_sink wide
+                    let exps_sink = |suffix: &str| -> Result<ExpertTensor> {
+                        let name = t(suffix);
+                        let ti = gguf.tensor(&name).ok_or_else(|| meta_err(&name))?;
+                        ExpertTensor::new(&gguf, ti, shape.n_shexp_sink)
+                    };
                     // router bias name varies by converter: bare on the
                     // antirez Hy3/GLM files, ".bias" on others
                     let probs_b_name = if gguf.tensor(&t("exp_probs_b")).is_some() {
@@ -1444,6 +1556,15 @@ mod real {
                         fused_up_off,
                         down_scale: if gguf.tensor(&t("ffn_down_exps.scale")).is_some() {
                             Some(upload(&file, &gguf, &t("ffn_down_exps.scale"))?)
+                        } else {
+                            None
+                        },
+                        sink: if ink_arch {
+                            Some([
+                                exps_sink("ffn_gate_shexps.weight")?,
+                                exps_sink("ffn_up_shexps.weight")?,
+                                exps_sink("ffn_down_shexps.weight")?,
+                            ])
                         } else {
                             None
                         },
@@ -1517,6 +1638,48 @@ mod real {
                 } else {
                     None
                 };
+                let ink = if ink_arch {
+                    let gm = geom[il as usize];
+                    // rel_proj gguf ne = [rel_extent, d_rel] (extent
+                    // fastest): transpose to [extent][d_rel] rows so
+                    // matmul_f32 contracts over d_rel
+                    let raw = read_tensor_f32(&file, &gguf, &t("attn_rel_proj.weight"))?;
+                    let ext = if gm.window != 0 { shape.rel_ext_swa } else { shape.rel_ext } as usize;
+                    let dr = shape.d_rel as usize;
+                    if raw.len() != ext * dr {
+                        return Err(format!(
+                            "blk.{il}.attn_rel_proj: {} elems, expected {ext}x{dr}",
+                            raw.len()
+                        )
+                        .into());
+                    }
+                    let mut tr = vec![0f32; raw.len()];
+                    for d in 0..dr {
+                        for e in 0..ext {
+                            tr[e * dr + d] = raw[d * ext + e];
+                        }
+                    }
+                    let mut rel_proj = DeviceBuf::alloc(tr.len() * 4)?;
+                    rel_proj.write(0, kernels::as_bytes(&tr))?;
+                    let upload_f32 = |name: &str| -> Result<DeviceBuf> {
+                        let v = read_tensor_f32(&file, &gguf, name)?;
+                        let mut b = DeviceBuf::alloc(v.len() * 4)?;
+                        b.write(0, kernels::as_bytes(&v))?;
+                        Ok(b)
+                    };
+                    Some(InkW {
+                        wr: upload_attn(&file, &gguf, &t("attn_r.weight"), &mut *attn_vram_budget)?,
+                        rel_proj,
+                        rel_extent: ext as u32,
+                        sconv_k: upload_f32(&t("shortconv_k.weight"))?,
+                        sconv_v: upload_f32(&t("shortconv_v.weight"))?,
+                        sconv_attn: upload_f32(&t("shortconv_attn.weight"))?,
+                        sconv_mlp: upload_f32(&t("shortconv_mlp.weight"))?,
+                        gscale: read_tensor_f32(&file, &gguf, &t("ffn_gscale.weight"))?[0],
+                    })
+                } else {
+                    None
+                };
                 Ok(LayerW {
                     attn_norm: upload(&file, &gguf, &t("attn_norm.weight"))?,
                     attn,
@@ -1524,6 +1687,7 @@ mod real {
                     ffn_norm: upload(&file, &gguf, &t("ffn_norm.weight"))?,
                     ffn,
                     gemma,
+                    ink,
                 })
             };
 
@@ -1613,6 +1777,28 @@ mod real {
             } else {
                 0.0
             };
+            let tok_norm = if ink_arch {
+                Some(upload(&file, &gguf, "token_embd_norm.weight")?)
+            } else {
+                None
+            };
+            let logit_scale = if ink_arch {
+                let denom = gguf
+                    .arch_meta("logit_scale_denom")
+                    .and_then(Value::as_f32)
+                    .ok_or_else(|| meta_err("logit_scale_denom"))?;
+                1.0 / denom
+            } else {
+                1.0
+            };
+            let n_vocab_out = if ink_arch {
+                gguf.arch_meta("unpadded_vocab_size")
+                    .and_then(Value::as_u64)
+                    .map(|v| v as u32)
+                    .unwrap_or(shape.n_vocab)
+            } else {
+                shape.n_vocab
+            };
             Ok(Model {
                 path: path.to_path_buf(),
                 shards,
@@ -1630,6 +1816,9 @@ mod real {
                 rope_factors,
                 embd_scale: if gemma_arch { (shape.n_embd as f32).sqrt() } else { 1.0 },
                 logit_softcap,
+                tok_norm,
+                logit_scale,
+                n_vocab_out,
             })
         }
     }
@@ -1814,6 +2003,13 @@ mod real {
         pub mtp_accepted: u64,
         /// q8_K activation scratch for a K-quant lm-head (1 f32 otherwise)
         head_xq: DeviceBuf,
+        // Inkling scratch (empty/dummies elsewhere): per-layer packed
+        // shortconv states [k | v | attn | mlp], the r projection, the
+        // rel-bias logits, and a sconv output bounce buffer
+        sconv_state: Vec<[DeviceBuf; 4]>,
+        sconv_tmp: DeviceBuf,
+        r_buf: DeviceBuf,
+        rel_buf: DeviceBuf,
         /// Unified-memory box (GB10/Spark, Jetson): host-cache slabs are
         /// device-speed, so expert resolve hands their pinned pointers to
         /// the kernels directly - no VRAM cache, no staging copies. Safe
@@ -2064,7 +2260,9 @@ mod real {
                 ffn_mid: f32s(mb * s.n_ff_dense.max(s.n_ff_exp))?,
                 ffn_out: f32s(mb * s.n_embd)?,
                 shared_out: f32s(mb * s.n_embd)?,
-                router_logits: f32s(mb * s.n_expert)?,
+                // +sink: the inkling gate matmul emits shared-expert
+                // logits after the routed ones
+                router_logits: f32s(mb * (s.n_expert + s.n_shexp_sink))?,
                 router_selected: DeviceBuf::alloc(mb as usize * n_used * 4)?,
                 router_weights: f32s(mb * s.n_expert_used)?,
                 moe_mid: f32s(mb * s.n_expert_used * s.n_ff_exp)?,
@@ -2108,7 +2306,7 @@ mod real {
                 logits: f32s(spec_rows * s.n_vocab)?,
                 store: StreamingStore::open(&m.shards, cache_bytes)?,
                 prefetcher: Prefetcher::spawn(&m.shards)?,
-                pred_logits: f32s(s.n_expert)?,
+                pred_logits: f32s(s.n_expert + s.n_shexp_sink)?,
                 pred_selected: DeviceBuf::alloc(n_used * 4)?,
                 pred_weights: f32s(s.n_expert_used)?,
                 prof: Prof::default(),
@@ -2165,6 +2363,34 @@ mod real {
                 } else {
                     f32s(1)?
                 },
+                sconv_state: if s.sconv_k > 1 {
+                    let d = s.sconv_k - 1;
+                    let mut v = Vec::with_capacity(s.n_exec_layer as usize);
+                    for il in 0..s.n_exec_layer as usize {
+                        let kvw = m
+                            .geom
+                            .get(il)
+                            .map(|g| g.n_head_kv * g.head_dim)
+                            .unwrap_or(s.n_head_kv * s.head_dim);
+                        let mk = |w: u32| -> Result<DeviceBuf> {
+                            let mut b = f32s(d * w)?;
+                            let n = b.bytes();
+                            kernels::zero(&mut b, n)?;
+                            Ok(b)
+                        };
+                        v.push([mk(kvw)?, mk(kvw)?, mk(s.n_embd)?, mk(s.n_embd)?]);
+                    }
+                    v
+                } else {
+                    Vec::new()
+                },
+                sconv_tmp: f32s(if s.sconv_k > 1 { mb * s.n_embd } else { 1 })?,
+                r_buf: f32s(if s.d_rel > 0 { mb * s.n_head * s.d_rel } else { 1 })?,
+                rel_buf: f32s(if s.d_rel > 0 {
+                    mb * s.n_head * s.rel_ext.max(s.rel_ext_swa)
+                } else {
+                    1
+                })?,
                 unified: {
                     let u = kernels::unified_memory();
                     if u {
@@ -2251,6 +2477,19 @@ mod real {
                 // gemma scales the residual stream by sqrt(n_embd)
                 kernels::scale(&mut st.cur, n_tok * s.n_embd, self.embd_scale)?;
             }
+            if let Some(tn) = &self.tok_norm {
+                // inkling: rms-norm the embedding rows once, post-lookup
+                kernels::rms_norm_inplace(&mut st.cur, tn, s.n_embd, n_tok, eps)?;
+            }
+            if pos0 == 0 {
+                // fresh sequence: shortconv history restarts at zero
+                for states in st.sconv_state.iter_mut() {
+                    for b in states.iter_mut() {
+                        let n = b.bytes();
+                        kernels::zero(b, n)?;
+                    }
+                }
+            }
 
             for (il, l) in self.layers.iter().enumerate() {
                 // stage layer il+1's pinned attn tensors under this
@@ -2291,6 +2530,15 @@ mod real {
             }
             if self.logit_softcap > 0.0 {
                 kernels::softcap(&mut st.logits, k * s.n_vocab, self.logit_softcap)?;
+            }
+            if self.logit_scale != 1.0 {
+                // inkling muP head: logits / logit_scale_denom
+                kernels::scale(&mut st.logits, k * s.n_vocab, self.logit_scale)?;
+            }
+            if self.n_vocab_out < s.n_vocab {
+                // padded vocab rows hold garbage weights - poison them so
+                // no sampler path can pick one
+                kernels::fill_row_tail(&mut st.logits, k, s.n_vocab, self.n_vocab_out, f32::NEG_INFINITY)?;
             }
             Ok(())
         }
@@ -2337,19 +2585,51 @@ mod real {
                             // attention_k_eq_v: v = the raw k projection
                             None => kernels::copy_across(&mut st.v, &st.k, (n_tok * hkv * hd) as usize * 4)?,
                         }
+                        if let Some(ink) = &l.ink {
+                            // inkling: k/v shortconvs on the flat
+                            // projections, before head norm (reference
+                            // order: matmul -> sconv -> reshape -> norm)
+                            let kvb = (n_tok * hkv * hd) as usize * 4;
+                            kernels::sconv(&mut st.sconv_tmp, &st.k, &ink.sconv_k, &mut st.sconv_state[il][0], n_tok, hkv * hd, s.sconv_k)?;
+                            kernels::copy_across(&mut st.k, &st.sconv_tmp, kvb)?;
+                            kernels::sconv(&mut st.sconv_tmp, &st.v, &ink.sconv_v, &mut st.sconv_state[il][1], n_tok, hkv * hd, s.sconv_k)?;
+                            kernels::copy_across(&mut st.v, &st.sconv_tmp, kvb)?;
+                        }
                         kernels::gqa_head_rms_norm(&mut st.q, Some(q_norm), n_tok * s.n_head, hd, eps)?;
                         kernels::gqa_head_rms_norm(&mut st.k, Some(k_norm), n_tok * hkv, hd, eps)?;
-                        if gm.is_some() {
+                        if gm.is_some() && l.ink.is_none() {
                             // gemma: v gets a weightless per-head rms norm
                             kernels::gqa_head_rms_norm(&mut st.v, None, n_tok * hkv, hd, eps)?;
                         }
-                        kernels::gqa_rope(&mut st.q, n_tok, s.n_head, hd, rot, pos0, theta, factors)?;
-                        kernels::gqa_rope(&mut st.k, n_tok, hkv, hd, rot, pos0, theta, factors)?;
+                        if l.ink.is_none() {
+                            // inkling has no rope: position rides the
+                            // relative bias below (log-N tau is identity
+                            // below 128k ctx, so it is skipped here)
+                            kernels::gqa_rope(&mut st.q, n_tok, s.n_head, hd, rot, pos0, theta, factors)?;
+                            kernels::gqa_rope(&mut st.k, n_tok, hkv, hd, rot, pos0, theta, factors)?;
+                        }
                         kernels::gqa_kv_append(&mut st.kcache[il], &st.k, n_tok, hkv, hd, st.ctx, pos0)?;
                         kernels::gqa_kv_append(&mut st.vcache[il], &st.v, n_tok, hkv, hd, st.ctx, pos0)?;
-                        // gemma scores at scale 1.0 (q is per-head normed)
-                        let scale = if gm.is_some() { 1.0 } else { 1.0 / (hd as f32).sqrt() };
-                        kernels::gqa_attention(&mut st.heads, &st.q, &st.kcache[il], &st.vcache[il], n_tok, s.n_head, hkv, hd, st.ctx, pos0, scale, window)?;
+                        // gemma scores at scale 1.0 (q is per-head normed);
+                        // inkling at muP 1/head_dim
+                        let scale = if l.ink.is_some() {
+                            1.0 / hd as f32
+                        } else if gm.is_some() {
+                            1.0
+                        } else {
+                            1.0 / (hd as f32).sqrt()
+                        };
+                        let rel_ext = if let Some(ink) = &l.ink {
+                            // rel-pos bias: rel_proj^T . (x . wr), per
+                            // (token, head) a rel_extent-long bias row
+                            kernels::matmul_q8_0(&mut st.r_buf, &ink.wr, &st.normed, s.n_embd, s.n_head * s.d_rel, n_tok)?;
+                            kernels::matmul_f32(&mut st.rel_buf, &ink.rel_proj, &st.r_buf, s.d_rel, ink.rel_extent, n_tok * s.n_head)?;
+                            ink.rel_extent
+                        } else {
+                            0
+                        };
+                        let rel = l.ink.as_ref().map(|_| &st.rel_buf);
+                        kernels::gqa_attention_rel(&mut st.heads, &st.q, &st.kcache[il], &st.vcache[il], n_tok, s.n_head, hkv, hd, st.ctx, pos0, scale, window, rel, rel_ext)?;
                     }
                     Attn::Mla { q_a, q_a_norm, q_b, kv_a_mqa, kv_a_norm, k_b, v_b, indexer } => {
                         // ds4's GLM compact-KV decode path: q through the
@@ -2463,6 +2743,12 @@ mod real {
                     // gemma post-attention norm sits INSIDE the residual
                     kernels::rms_norm_inplace(&mut st.attn_out, &gw.attn_post_norm, s.n_embd, n_tok, eps)?;
                 }
+                if let Some(ink) = &l.ink {
+                    // inkling: the attention output stream gets its own
+                    // shortconv before rejoining the residual
+                    kernels::sconv(&mut st.sconv_tmp, &st.attn_out, &ink.sconv_attn, &mut st.sconv_state[il][2], n_tok, s.n_embd, s.sconv_k)?;
+                    kernels::copy_across(&mut st.attn_out, &st.sconv_tmp, (n_tok * s.n_embd) as usize * 4)?;
+                }
                 kernels::add(&mut st.after_attn, &st.cur, &st.attn_out, n_tok * s.n_embd)?;
 
                 // ffn
@@ -2475,10 +2761,27 @@ mod real {
                         // (M3: swiglu_oai on dense AND experts AND shexp)
                         kernels::swiglu(&mut st.ffn_mid, &st.gate_act, &st.up_act, n_tok * s.n_ff_dense, 0.0, 1.0, s.moe_act_op)?;
                         kernels::matmul_q8_0(&mut st.ffn_out, down, &st.ffn_mid, s.n_ff_dense, s.n_embd, n_tok)?;
+                        if let Some(ink) = &l.ink {
+                            // inkling: dense output rides gscale + its own
+                            // shortconv stream before the residual
+                            if ink.gscale != 1.0 {
+                                kernels::scale(&mut st.ffn_out, n_tok * s.n_embd, ink.gscale)?;
+                            }
+                            kernels::sconv(&mut st.sconv_tmp, &st.ffn_out, &ink.sconv_mlp, &mut st.sconv_state[il][3], n_tok, s.n_embd, s.sconv_k)?;
+                            kernels::copy_across(&mut st.ffn_out, &st.sconv_tmp, (n_tok * s.n_embd) as usize * 4)?;
+                        }
                         kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, n_tok * s.n_embd)?;
                     }
-                    Ffn::Moe { gate_inp, probs_b, shexp, gate_exps, up_exps, down_exps, fused_up_off, down_scale } => {
+                    Ffn::Moe { gate_inp, probs_b, shexp, gate_exps, up_exps, down_exps, fused_up_off, down_scale, sink } => {
                         let gw = l.gemma.as_ref();
+                        // inkling: shared experts ride the router as
+                        // always-on slots; per-layer gscale folds into the
+                        // route-weight scale (every FFN output is linear
+                        // in the weights)
+                        let sink_n = if sink.is_some() { s.n_shexp_sink } else { 0 };
+                        let route_k = s.n_expert_used - sink_n;
+                        let route_scale = s.expert_weight_scale
+                            * l.ink.as_ref().map_or(1.0, |i| i.gscale);
                         if let Some(gw) = gw {
                             // gemma routes on rms(attn_out) * gate_inp_s /
                             // sqrt(n_embd) - one weighted rms_norm; attn_out
@@ -2486,7 +2789,9 @@ mod real {
                             kernels::rms_norm(&mut st.attn_out, &st.after_attn, &gw.router_norm, s.n_embd, n_tok, eps)?;
                             kernels::matmul_f32(&mut st.router_logits, gate_inp, &st.attn_out, s.n_embd, s.n_expert, n_tok)?;
                         } else {
-                            kernels::matmul_f32(&mut st.router_logits, gate_inp, &st.normed, s.n_embd, s.n_expert, n_tok)?;
+                            // inkling's gate matmul emits the sink logits
+                            // after the n_expert routed ones
+                            kernels::matmul_f32(&mut st.router_logits, gate_inp, &st.normed, s.n_embd, s.n_expert + sink_n, n_tok)?;
                         }
                         kernels::router_select(
                             &mut st.router_selected,
@@ -2494,11 +2799,11 @@ mod real {
                             &st.router_logits,
                             probs_b,
                             s.n_expert,
-                            s.n_expert_used,
-                            s.expert_weight_scale,
+                            route_k,
+                            route_scale,
                             n_tok,
-                            s.router_softmax as u32,
-                            0,
+                            if sink_n > 0 { 2 } else { s.router_softmax as u32 },
+                            sink_n,
                         )?;
                         if let Some(ds) = down_scale {
                             // per-expert down scale folds into the route
@@ -2529,18 +2834,18 @@ mod real {
                             None
                         };
                         if let Some((n_gate_inp, n_probs_b, _)) = &next_moe {
-                            kernels::matmul_f32(&mut st.pred_logits, n_gate_inp, &st.normed, s.n_embd, s.n_expert, 1)?;
+                            kernels::matmul_f32(&mut st.pred_logits, n_gate_inp, &st.normed, s.n_embd, s.n_expert + sink_n, 1)?;
                             kernels::router_select(
                                 &mut st.pred_selected,
                                 &mut st.pred_weights,
                                 &st.pred_logits,
                                 n_probs_b,
                                 s.n_expert,
-                                s.n_expert_used,
-                                s.expert_weight_scale,
+                                route_k,
+                                route_scale,
                                 1,
-                                s.router_softmax as u32,
-                                0,
+                                if sink_n > 0 { 2 } else { s.router_softmax as u32 },
+                                sink_n,
                             )?;
                         }
 
@@ -2644,13 +2949,29 @@ mod real {
                         let mut distinct: Vec<i32> = selected
                             .iter()
                             .copied()
-                            .filter(|&e| e >= 0 && (e as u32) < s.n_expert)
+                            .filter(|&e| e >= 0 && (e as u32) < s.n_expert + sink_n)
                             .collect();
                         distinct.sort_unstable();
                         distinct.dedup();
+                        // id -> the three slabs it lives in: routed ids hit
+                        // gate/up/down_exps, sink ids (>= n_expert) index
+                        // the inkling shexp bank
+                        let slabs_of = |e: u32| -> [(&ExpertTensor, u64); 3] {
+                            if e < s.n_expert {
+                                [(gate_exps, e as u64), (up_exps, e as u64), (down_exps, e as u64)]
+                            } else {
+                                let sk = sink.as_ref().unwrap();
+                                let le = (e - s.n_expert) as u64;
+                                [(&sk[0], le), (&sk[1], le), (&sk[2], le)]
+                            }
+                        };
+                        let off_of = |t: &ExpertTensor, le: u64| t.abs_offset + le * t.expert_bytes;
                         // resident-tier experts compute on their own card;
                         // they are never fetched, cached, or staged here
                         let tier_of = |e: i32| -> Option<(usize, ExpertPtrs)> {
+                            if e as u32 >= s.n_expert {
+                                return None; // sink slabs never tier
+                            }
                             let g = gate_exps.abs_offset + e as u64 * gate_exps.expert_bytes;
                             // resident MTP experts beat a tier copy (same
                             // device as the compute, no partial gather)
@@ -2675,15 +2996,15 @@ mod real {
                             if tier_of(e).is_some() {
                                 // keep the census warm for resident slabs
                                 // or their heat freezes at placement time
-                                for t in [gate_exps, up_exps, down_exps] {
-                                    let off = t.abs_offset + e as u64 * t.expert_bytes;
+                                for (t, le) in slabs_of(e as u32) {
+                                    let off = off_of(t, le);
                                     st.dev_cache.touch.entry(off).or_insert((0, t.expert_bytes)).0 += 1;
                                 }
                                 continue;
                             }
-                            for t in [gate_exps, up_exps, down_exps] {
+                            for (t, le) in slabs_of(e as u32) {
                                 let r = stream::Read {
-                                    offset: t.abs_offset + e as u64 * t.expert_bytes,
+                                    offset: off_of(t, le),
                                     len: t.expert_bytes,
                                 };
                                 // fused gate_up: gate and up share a slab -
@@ -2720,7 +3041,10 @@ mod real {
                         let slab = gate_exps
                             .expert_bytes
                             .max(up_exps.expert_bytes)
-                            .max(down_exps.expert_bytes) as usize;
+                            .max(down_exps.expert_bytes)
+                            .max(sink.as_ref().map_or(0, |sk| {
+                                sk.iter().map(|t| t.expert_bytes).max().unwrap_or(0)
+                            })) as usize;
                         if wants.len() * slab > st.staging.bytes() {
                             st.staging = DeviceBuf::alloc(wants.len() * slab + SLAB_SLACK)?;
                         }
@@ -2752,7 +3076,20 @@ mod real {
                             Ok(())
                         })?;
                         st.prof.h2d += h2d;
+                        // sink slabs join the routed launch only when the
+                        // bank shares quant AND row width; otherwise they
+                        // run as a second NULL-masked launch below
+                        let sink_same = sink.as_ref().is_none_or(|sk| {
+                            sk[0].quant == gate_exps.quant && sk[0].row_bytes == gate_exps.row_bytes
+                                && sk[1].quant == up_exps.quant && sk[1].row_bytes == up_exps.row_bytes
+                                && sk[2].quant == down_exps.quant && sk[2].row_bytes == down_exps.row_bytes
+                        });
                         let mut ptrs = Vec::with_capacity(selected.len());
+                        let mut sink_ptrs: Vec<ExpertPtrs> = if sink_same {
+                            Vec::new()
+                        } else {
+                            vec![ExpertPtrs::NULL; selected.len()]
+                        };
                         let mut tptrs: Vec<Vec<ExpertPtrs>> = st
                             .tiers
                             .iter()
@@ -2760,7 +3097,7 @@ mod real {
                             .collect();
                         let mut tier_slots = vec![0u64; st.tiers.len()];
                         for (si, &e) in selected.iter().enumerate() {
-                            if e < 0 || e as u32 >= s.n_expert {
+                            if e < 0 || e as u32 >= s.n_expert + sink_n {
                                 ptrs.push(ExpertPtrs::NULL);
                                 continue;
                             }
@@ -2770,14 +3107,18 @@ mod real {
                                 tier_slots[ti] += 1;
                                 continue;
                             }
-                            let p = |t: &ExpertTensor| {
-                                resolved[&(t.abs_offset + e as u64 * t.expert_bytes)]
+                            let [g3, u3, d3] = slabs_of(e as u32);
+                            let ep = ExpertPtrs {
+                                gate: resolved[&off_of(g3.0, g3.1)],
+                                up: byte_off(resolved[&off_of(u3.0, u3.1)], *fused_up_off),
+                                down: resolved[&off_of(d3.0, d3.1)],
                             };
-                            ptrs.push(ExpertPtrs {
-                                gate: p(gate_exps),
-                                up: byte_off(p(up_exps), *fused_up_off),
-                                down: p(down_exps),
-                            });
+                            if !sink_same && e as u32 >= s.n_expert {
+                                sink_ptrs[si] = ep;
+                                ptrs.push(ExpertPtrs::NULL);
+                            } else {
+                                ptrs.push(ep);
+                            }
                         }
                         st.expert_ptrs.write(0, kernels::as_bytes(&ptrs))?;
 
@@ -2886,6 +3227,25 @@ mod real {
                             )?;
                         }
 
+                        // inkling sink bank on its own quant: second NULL-
+                        // masked pass over the same slots (routed slots
+                        // NULL here, so only the sink rows contribute);
+                        // ffn_out is free until the final adds below
+                        if !sink_same {
+                            let sk = sink.as_ref().unwrap();
+                            st.expert_ptrs.write(0, kernels::as_bytes(&sink_ptrs))?;
+                            kernels::moe_pair_swiglu(
+                                &mut st.moe_mid, &st.expert_ptrs, &st.router_weights, &st.xq,
+                                s.n_embd, s.n_ff_exp, s.n_expert_used, n_tok, sk[0].row_bytes, sk[0].quant, s.moe_act_op,
+                            )?;
+                            kernels::quantize_q8_k(&mut st.midq, &st.moe_mid, s.n_ff_exp, n_tok * s.n_expert_used)?;
+                            kernels::moe_down(
+                                &mut st.ffn_out, &st.expert_ptrs, &st.midq,
+                                s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, sk[2].row_bytes, sk[2].quant,
+                            )?;
+                            kernels::add_assign(&mut st.moe_out, &st.ffn_out, n_tok * s.n_embd)?;
+                        }
+
                         // gather tier partials (blocking copy issued on the
                         // tier's device = ordered after its kernels).
                         // NOTE: summing partials reorders float adds vs the
@@ -2908,6 +3268,13 @@ mod real {
                         kernels::add(&mut st.ffn_out, &st.moe_out, &st.shared_out, n_tok * s.n_embd)?;
                         if let Some(gw) = gw {
                             kernels::rms_norm_inplace(&mut st.ffn_out, &gw.post_ffw_norm, s.n_embd, n_tok, eps)?;
+                        }
+                        if let Some(ink) = &l.ink {
+                            // inkling: the whole MoE output (routed + sink,
+                            // gscale already in the route weights) gets the
+                            // mlp shortconv before the residual
+                            kernels::sconv(&mut st.sconv_tmp, &st.ffn_out, &ink.sconv_mlp, &mut st.sconv_state[il][3], n_tok, s.n_embd, s.sconv_k)?;
+                            kernels::copy_across(&mut st.ffn_out, &st.sconv_tmp, (n_tok * s.n_embd) as usize * 4)?;
                         }
                         kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, n_tok * s.n_embd)?;
                         if let Some(gw) = gw {

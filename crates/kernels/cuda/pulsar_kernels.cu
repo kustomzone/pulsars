@@ -3525,6 +3525,28 @@ extern "C" int pulsar_sconv_selftest(void) {
     return ok;
 }
 
+/* Poison the padded tail of each logits row (inkling pads the vocab:
+ * rows past unpadded_vocab_size hold garbage weights). */
+__global__ static void fill_row_tail_kernel(
+        float *x, uint32_t rows, uint32_t row_w, uint32_t keep, float v) {
+    const uint32_t tail = row_w - keep;
+    const uint64_t total = (uint64_t)rows * tail;
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const uint32_t r = (uint32_t)(i / tail);
+    const uint32_t c = keep + (uint32_t)(i % tail);
+    x[(uint64_t)r * row_w + c] = v;
+}
+
+extern "C" int pulsar_fill_row_tail(
+        void *x_dev, uint32_t rows, uint32_t row_w, uint32_t keep, float v) {
+    if (rows == 0 || keep >= row_w) return 1; /* nothing to poison */
+    const uint64_t total = (uint64_t)rows * (row_w - keep);
+    fill_row_tail_kernel<<<(uint32_t)((total + 255u) / 256u), 256>>>(
+            (float *)x_dev, rows, row_w, keep, v);
+    return cuda_ok(cudaGetLastError(), "fill row tail launch");
+}
+
 __global__ static void scale_kernel(float *x, uint32_t n, float c) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] *= c;
