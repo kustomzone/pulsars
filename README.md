@@ -53,8 +53,10 @@ determinism on a fixed code path (`--decode-consistency`, below).
 
 - Linux (io_uring and CUDA are load-bearing; the workspace *compiles* on
   macOS but the engine is stubbed out there)
-- One or more NVIDIA GPUs, Ada (sm_89) and newer by default — Blackwell
-  runs via PTX JIT; `PULSAR_CUDA_ARCH` overrides codegen targets
+- One or more NVIDIA GPUs, GTX 10-series (Pascal, sm_61) or newer — the
+  default build ships native code for 10/16/20, 30, and 40-series plus
+  PTX that JITs on everything else (50-series Blackwell, Volta, Hopper).
+  `PULSAR_CUDA_ARCH` overrides codegen targets
 - CUDA toolkit with `nvcc` on PATH, plus a host compiler nvcc accepts
   (gcc-12 works; newer gcc may need `CXX=g++-12` at build time)
 - Rust via [rustup](https://rustup.rs)
