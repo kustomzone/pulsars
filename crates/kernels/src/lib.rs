@@ -84,7 +84,7 @@ mod real {
         fn pulsar_softcap(x: *mut c_void, n: u32, cap: f32) -> i32;
         fn pulsar_router_scale_selected(w: *mut c_void, sel: *const c_void, scale: *const c_void, n: u32, n_expert: u32) -> i32;
         fn pulsar_add(out: *mut c_void, a: *const c_void, b: *const c_void, n: u32) -> i32;
-        fn pulsar_router_select(selected: *mut c_void, weights: *mut c_void, logits: *const c_void, bias: *const c_void, n_expert: u32, k_used: u32, weight_scale: f32, n_tok: u32, softmax_mode: u32) -> i32;
+        fn pulsar_router_select(selected: *mut c_void, weights: *mut c_void, logits: *const c_void, bias: *const c_void, n_expert: u32, k_used: u32, weight_scale: f32, n_tok: u32, softmax_mode: u32, n_shexp: u32) -> i32;
         fn pulsar_quantize_q8_K(out: *mut c_void, x: *const c_void, in_dim: u32, n_rows: u32) -> i32;
         fn pulsar_moe_pair_swiglu(mid: *mut c_void, ptrs: *const c_void, weights: *const c_void, x: *const c_void, in_dim: u32, mid_dim: u32, n_used: u32, n_tok: u32, row_bytes: u64, quant: u32, act_op: u32) -> i32;
         fn pulsar_moe_down(out: *mut c_void, ptrs: *const c_void, mid: *const c_void, mid_dim: u32, out_dim: u32, n_used: u32, n_tok: u32, row_bytes: u64, quant: u32) -> i32;
@@ -94,7 +94,9 @@ mod real {
         fn pulsar_gqa_head_rms_norm(x: *mut c_void, w: *const c_void, rows: u32, head_dim: u32, eps: f32) -> i32;
         fn pulsar_gqa_rope(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, theta: f32, factors: *const c_void) -> i32;
         fn pulsar_gqa_kv_append(cache: *mut c_void, kv: *const c_void, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32) -> i32;
-        fn pulsar_gqa_attention(out: *mut c_void, q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, scale: f32, window: u32) -> i32;
+        fn pulsar_gqa_attention(out: *mut c_void, q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, scale: f32, window: u32, rel: *const c_void, rel_extent: u32) -> i32;
+
+        fn pulsar_sconv(out: *mut c_void, x: *const c_void, kern: *const c_void, state: *mut c_void, n_tok: u32, w: u32, k: u32) -> i32;
 
         fn pulsar_gqa_selftest() -> i32;
         fn pulsar_q8_0_matmul_selftest() -> i32;
@@ -102,6 +104,7 @@ mod real {
         fn pulsar_moe_selftest() -> i32;
         fn pulsar_glue_selftest() -> i32;
         fn pulsar_mla_selftest() -> i32;
+        fn pulsar_sconv_selftest() -> i32;
 
         fn pulsar_mla_rope_tail(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, n_ctx_orig: u32, freq_base: f32, freq_scale: f32, ext_factor: f32, attn_factor: f32, beta_fast: f32, beta_slow: f32) -> i32;
         fn pulsar_mla_kv_lora_rms_norm(out: *mut c_void, kv_raw: *const c_void, w: *const c_void, n_tok: u32, kv_raw_dim: u32, kv_lora_dim: u32, eps: f32) -> i32;
@@ -712,11 +715,14 @@ mod real {
         check(unsafe { pulsar_add(o, o as *const c_void, b.ptr(), n) }, "add_assign")
     }
 
+    /// mode: 0 = sigmoid+bias (Hy3/GLM/M3), 1 = softmax (qwen3moe/gemma4),
+    /// 2 = inkling sink (n_shexp shared experts append as slots k..k+n_shexp
+    /// with logsigmoid-softmax weights; selected/weights hold k+n_shexp).
     #[allow(clippy::too_many_arguments)]
-    pub fn router_select(selected: &mut DeviceBuf, weights: &mut DeviceBuf, logits: &DeviceBuf, bias: &DeviceBuf, n_expert: u32, k_used: u32, weight_scale: f32, n_tok: u32, softmax: bool) -> Result {
+    pub fn router_select(selected: &mut DeviceBuf, weights: &mut DeviceBuf, logits: &DeviceBuf, bias: &DeviceBuf, n_expert: u32, k_used: u32, weight_scale: f32, n_tok: u32, mode: u32, n_shexp: u32) -> Result {
         check(
             unsafe {
-                pulsar_router_select(selected.ptr_mut(), weights.ptr_mut(), logits.ptr(), bias.ptr(), n_expert, k_used, weight_scale, n_tok, softmax as u32)
+                pulsar_router_select(selected.ptr_mut(), weights.ptr_mut(), logits.ptr(), bias.ptr(), n_expert, k_used, weight_scale, n_tok, mode, n_shexp)
             },
             "router_select",
         )
@@ -766,16 +772,36 @@ mod real {
 
     #[allow(clippy::too_many_arguments)]
     pub fn gqa_attention(out: &mut DeviceBuf, q: &DeviceBuf, k_cache: &DeviceBuf, v_cache: &DeviceBuf, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, scale: f32, window: u32) -> Result {
+        gqa_attention_rel(out, q, k_cache, v_cache, n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window, None, 0)
+    }
+
+    /// GQA attention with an optional inkling relative-position bias:
+    /// rel is [n_tok][n_head][rel_extent], score(i,j) += rel[i-j] in-band.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gqa_attention_rel(out: &mut DeviceBuf, q: &DeviceBuf, k_cache: &DeviceBuf, v_cache: &DeviceBuf, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32, scale: f32, window: u32, rel: Option<&DeviceBuf>, rel_extent: u32) -> Result {
         check(
             unsafe {
-                pulsar_gqa_attention(out.ptr_mut(), q.ptr(), k_cache.ptr(), v_cache.ptr(), n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window)
+                pulsar_gqa_attention(out.ptr_mut(), q.ptr(), k_cache.ptr(), v_cache.ptr(), n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window, rel.map_or(std::ptr::null(), |r| r.ptr()), rel_extent)
             },
             "gqa_attention",
         )
     }
 
+    /// Inkling shortconv: out = x + causal depthwise conv over the last K
+    /// inputs; state [w][K-1] rolls forward (zero it at pos 0). out != x.
+    pub fn sconv(out: &mut DeviceBuf, x: &DeviceBuf, kern: &DeviceBuf, state: &mut DeviceBuf, n_tok: u32, w: u32, k: u32) -> Result {
+        check(
+            unsafe { pulsar_sconv(out.ptr_mut(), x.ptr(), kern.ptr(), state.ptr_mut(), n_tok, w, k) },
+            "sconv",
+        )
+    }
+
     pub fn gqa_selftest() -> bool {
         unsafe { pulsar_gqa_selftest() != 0 }
+    }
+
+    pub fn sconv_selftest() -> bool {
+        unsafe { pulsar_sconv_selftest() != 0 }
     }
 
     pub fn q8_0_matmul_selftest() -> bool {
@@ -883,6 +909,12 @@ mod tests {
     #[ignore = "requires a CUDA device"]
     fn moe_kernels_match_cpu_reference() {
         assert!(super::moe_selftest());
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn sconv_matches_cpu_reference() {
+        assert!(super::sconv_selftest());
     }
 
     #[test]

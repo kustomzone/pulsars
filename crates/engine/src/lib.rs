@@ -2497,7 +2497,8 @@ mod real {
                             s.n_expert_used,
                             s.expert_weight_scale,
                             n_tok,
-                            s.router_softmax,
+                            s.router_softmax as u32,
+                            0,
                         )?;
                         if let Some(ds) = down_scale {
                             // per-expert down scale folds into the route
@@ -2538,7 +2539,8 @@ mod real {
                                 s.n_expert_used,
                                 s.expert_weight_scale,
                                 1,
-                                s.router_softmax,
+                                s.router_softmax as u32,
+                                0,
                             )?;
                         }
 

@@ -114,7 +114,9 @@ __global__ static void gqa_attention_kernel(
         uint32_t cap,
         uint32_t pos0,
         float scale,         /* qk scale (1/sqrt(head_dim) for vanilla) */
-        uint32_t window) {   /* sliding window; 0 = full causal */
+        uint32_t window,     /* sliding window; 0 = full causal */
+        const float *rel,    /* inkling rel-pos bias [n_tok][n_head][rel_extent], NULL = none */
+        uint32_t rel_extent) {
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tok || h >= n_head) return;
@@ -122,6 +124,10 @@ __global__ static void gqa_attention_kernel(
     uint32_t n_rows = pos0 + t + 1u;
     uint32_t row0 = (window != 0u && n_rows > window) ? n_rows - window : 0u;
     const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    /* rel bias row for this (token, head): score(q at pos0+t, key j) +=
+     * rel_row[(pos0+t) - j] when the distance is inside the extent; the
+     * bias rides OUTSIDE the qk scale (reference folds 1/head_dim into q) */
+    const float *rel_row = rel ? rel + ((uint64_t)t * n_head + h) * rel_extent : NULL;
     const float *kh = k_cache + (uint64_t)kvh * cap * head_dim;
     const float *vh = v_cache + (uint64_t)kvh * cap * head_dim;
     /* Online softmax, single pass over K and V.  128 threads: thread d owns
@@ -149,6 +155,10 @@ __global__ static void gqa_attention_kernel(
             float dot = 0.0f;
             for (uint32_t d = 0; d < head_dim; d++) dot += sq[d] * krow[d];
             s = dot * scale;
+            if (rel_row) {
+                const uint32_t dist = (pos0 + t) - (base + tid);
+                if (dist < rel_extent) s += rel_row[dist];
+            }
         }
         red[tid] = s;
         __syncthreads();
@@ -220,17 +230,20 @@ extern "C" int ds4_gpu_gqa_attention(
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
         uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
         uint32_t head_dim, uint32_t cap, uint32_t pos0,
-        float scale, uint32_t window) {
+        float scale, uint32_t window,
+        const ds4_gpu_tensor *rel, uint32_t rel_extent) {
     if (!out || !q || !k_cache || !v_cache ||
         n_head == 0 || n_kv_head == 0 || n_head % n_kv_head != 0 ||
-        head_dim == 0 || head_dim > 512u || pos0 + n_tok > cap) {
+        head_dim == 0 || head_dim > 512u || pos0 + n_tok > cap ||
+        (rel && rel_extent == 0)) {
         return 0;
     }
     dim3 grid(n_tok, n_head, 1);
     gqa_attention_kernel<<<grid, 128>>>(
             (float *)out->ptr, (const float *)q->ptr,
             (const float *)k_cache->ptr, (const float *)v_cache->ptr,
-            n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window);
+            n_tok, n_head, n_kv_head, head_dim, cap, pos0, scale, window,
+            rel ? (const float *)rel->ptr : NULL, rel_extent);
     return cuda_ok(cudaGetLastError(), "gqa attention launch");
 }
 
@@ -388,7 +401,7 @@ extern "C" int ds4_gpu_gqa_selftest(void) {
                  ds4_gpu_gqa_kv_cache_append(g_kc, g_k, n_tok, n_kv_head, hd, cap, pos0) &&
                  ds4_gpu_gqa_kv_cache_append(g_vc, g_v, n_tok, n_kv_head, hd, cap, pos0) &&
                  ds4_gpu_gqa_attention(g_out, g_q, g_kc, g_vc, n_tok, n_head, n_kv_head, hd, cap, pos0,
-                                       1.0f / sqrtf((float)hd), 0u) &&
+                                       1.0f / sqrtf((float)hd), 0u, NULL, 0u) &&
                  cuda_ok(cudaDeviceSynchronize(), "gqa selftest sync");
         float *gpu_out = (float *)malloc(q_elems * sizeof(float));
         if (ok) ok = ds4_gpu_tensor_read(g_out, 0, gpu_out, q_elems * sizeof(float)) != 0;

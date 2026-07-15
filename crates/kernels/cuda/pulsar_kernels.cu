@@ -624,28 +624,39 @@ __device__ __forceinline__ static bool router_better(
     return av > bv || (av == bv && ai < bi);
 }
 
-/* softmax_mode (qwen3moe): softmax(logits) then renormalize over the
+/* softmax_mode 1 (qwen3moe): softmax(logits) then renormalize over the
  * selected k is algebraically softmax over just the selected logits, and
  * softmax is monotonic so top-k by prob == top-k by logit. So: select on
- * raw logits, then exp-normalize the k winners. */
+ * raw logits, then exp-normalize the k winners.
+ *
+ * softmax_mode 2 (inkling sink): the gate matmul emits n_expert routed
+ * logits + n_shexp shared-expert logits per token. Selection = mode-0
+ * (sigmoid + bias) over the routed rows only; weights = softmax of
+ * logsigmoid over [k winners' raw logits ++ shared logits] * scale, and
+ * the shared experts append as always-selected slots k_used..k_used+n_shexp
+ * with ids n_expert+s (their gammas ride the same weights array). */
 template <uint32_t J>
 __global__ static void router_select_kernel(
-        int32_t *selected,         /* [n_tok][k_used] */
-        float *weights,            /* [n_tok][k_used] */
-        const float *logits,       /* [n_tok][n_expert] */
+        int32_t *selected,         /* [n_tok][k_used(+n_shexp)] */
+        float *weights,            /* [n_tok][k_used(+n_shexp)] */
+        const float *logits,       /* [n_tok][n_expert(+n_shexp)] */
         const float *bias,         /* [n_expert] */
         uint32_t n_expert,
         uint32_t k_used,
         float weight_scale,
         uint32_t n_tok,
-        uint32_t softmax_mode) {
+        uint32_t softmax_mode,
+        uint32_t n_shexp) {        /* mode 2 only; 0 otherwise */
     const uint32_t lane = threadIdx.x;
     const uint32_t token = blockIdx.x * blockDim.y + threadIdx.y;
     if (token >= n_tok || lane >= 32u) return;
 
-    const float *log = logits + (uint64_t)token * n_expert;
-    int32_t *sel = selected + (uint64_t)token * k_used;
-    float *w = weights + (uint64_t)token * k_used;
+    const uint32_t sink = softmax_mode == 2u ? n_shexp : 0u;
+    const uint32_t n_logit = n_expert + sink;
+    const uint32_t n_slot = k_used + sink;
+    const float *log = logits + (uint64_t)token * n_logit;
+    int32_t *sel = selected + (uint64_t)token * n_slot;
+    float *w = weights + (uint64_t)token * n_slot;
 
     float local_prob[J];
     float local_score[J];
@@ -653,8 +664,10 @@ __global__ static void router_select_kernel(
     for (uint32_t j = 0; j < J; j++) {
         const uint32_t e = lane + j * 32u;
         if (e < n_expert) {
-            const float p = softmax_mode ? log[e] : router_sigmoid(log[e]);
-            local_prob[j] = p;
+            const float raw = log[e];
+            const float p = softmax_mode == 1u ? raw : router_sigmoid(raw);
+            /* mode 2 weights use the raw winner logit, not its sigmoid */
+            local_prob[j] = softmax_mode == 2u ? raw : p;
             local_score[j] = p + bias[e];
         } else {
             local_prob[j] = 0.0f;
@@ -700,7 +713,27 @@ __global__ static void router_select_kernel(
     }
 
     if (lane == 0) {
-        if (softmax_mode) {
+        if (softmax_mode == 2u) {
+            /* append the always-on shared experts, then weight everyone by
+             * softmax(logsigmoid(raw logit)) * scale (logsigmoid(x) =
+             * -softplus(-x); softmax input <= 0, plain exp-sum is safe) */
+            for (uint32_t s = 0; s < sink; s++) {
+                sel[k_used + s] = (int32_t)(n_expert + s);
+                w[k_used + s] = log[n_expert + s];
+            }
+            float m = -INFINITY;
+            for (uint32_t k = 0; k < n_slot; k++) {
+                const float x = w[k];
+                w[k] = x < 0.0f ? x - log1pf(expf(x)) : -log1pf(expf(-x));
+                m = fmaxf(m, w[k]);
+            }
+            float es = 0.0f;
+            for (uint32_t k = 0; k < n_slot; k++) {
+                w[k] = expf(w[k] - m);
+                es += w[k];
+            }
+            for (uint32_t k = 0; k < n_slot; k++) w[k] = w[k] / es * weight_scale;
+        } else if (softmax_mode == 1u) {
             float m = -INFINITY;
             for (uint32_t k = 0; k < k_used; k++) m = fmaxf(m, w[k]);
             float es = 0.0f;
@@ -717,31 +750,33 @@ __global__ static void router_select_kernel(
 }
 
 extern "C" int pulsar_router_select(
-        void *selected_dev,        /* int32 [n_tok][k_used] */
-        void *weights_dev,         /* f32   [n_tok][k_used] */
-        const void *logits_dev,    /* f32   [n_tok][n_expert] */
+        void *selected_dev,        /* int32 [n_tok][k_used(+n_shexp)] */
+        void *weights_dev,         /* f32   [n_tok][k_used(+n_shexp)] */
+        const void *logits_dev,    /* f32   [n_tok][n_expert(+n_shexp)] */
         const void *bias_dev,      /* f32   [n_expert] */
         uint32_t n_expert,
         uint32_t k_used,
         float weight_scale,
         uint32_t n_tok,
-        uint32_t softmax_mode) {
-    if (n_expert == 0 || n_expert > 512u || k_used == 0 || k_used > n_expert ||
-        n_tok == 0) {
+        uint32_t softmax_mode,
+        uint32_t n_shexp) {
+    if (n_expert == 0 || k_used == 0 || k_used > n_expert || n_tok == 0 ||
+        (softmax_mode != 2u && n_shexp != 0) ||
+        n_expert + (softmax_mode == 2u ? n_shexp : 0u) > 512u) {
         return 0;
     }
     dim3 block(32, 4, 1);
-    if (n_expert > 256u) {
+    if (n_expert > 256u || (softmax_mode == 2u && n_expert + n_shexp > 256u)) {
         router_select_kernel<16><<<(n_tok + 3u) / 4u, block>>>(
                 (int32_t *)selected_dev, (float *)weights_dev,
                 (const float *)logits_dev, (const float *)bias_dev,
-                n_expert, k_used, weight_scale, n_tok, softmax_mode);
+                n_expert, k_used, weight_scale, n_tok, softmax_mode, n_shexp);
         return cuda_ok(cudaGetLastError(), "router select launch");
     }
     router_select_kernel<8><<<(n_tok + 3u) / 4u, block>>>(
             (int32_t *)selected_dev, (float *)weights_dev,
             (const float *)logits_dev, (const float *)bias_dev,
-            n_expert, k_used, weight_scale, n_tok, softmax_mode);
+            n_expert, k_used, weight_scale, n_tok, softmax_mode, n_shexp);
     return cuda_ok(cudaGetLastError(), "router select launch");
 }
 
@@ -805,7 +840,7 @@ static int router_selftest_one(uint32_t n_expert, uint32_t k_used,
              cuda_ok(cudaMemcpy(log_dev, logits, log_bytes, cudaMemcpyHostToDevice), "logits h2d") &&
              cuda_ok(cudaMemcpy(bias_dev, bias, bias_bytes, cudaMemcpyHostToDevice), "bias h2d") &&
              pulsar_router_select(sel_dev, w_dev, log_dev, bias_dev,
-                                  n_expert, k_used, scale, n_tok, softmax) &&
+                                  n_expert, k_used, scale, n_tok, softmax, 0) &&
              cuda_ok(cudaDeviceSynchronize(), "sync") &&
              cuda_ok(cudaMemcpy(sel_gpu, sel_dev, sel_bytes, cudaMemcpyDeviceToHost), "sel d2h") &&
              cuda_ok(cudaMemcpy(w_gpu, w_dev, w_bytes, cudaMemcpyDeviceToHost), "w d2h");
@@ -831,14 +866,104 @@ static int router_selftest_one(uint32_t n_expert, uint32_t k_used,
     return ok;
 }
 
+/* mode 2 (inkling sink): CPU reference mirrors the llama.cpp graph -
+ * select top-k by sigmoid+bias over routed rows, weights = softmax of
+ * logsigmoid over [k winners' raw logits ++ shared logits] * scale. */
+static int router_sink_selftest_one(uint32_t n_expert, uint32_t k_used,
+                                    uint32_t n_shexp, float scale,
+                                    uint32_t n_tok) {
+    const uint32_t n_logit = n_expert + n_shexp;
+    const uint32_t n_slot = k_used + n_shexp;
+    float *logits = (float *)malloc((uint64_t)n_tok * n_logit * sizeof(float));
+    float *bias = (float *)malloc((uint64_t)n_expert * sizeof(float));
+    int32_t *sel_ref = (int32_t *)malloc((uint64_t)n_tok * n_slot * sizeof(int32_t));
+    float *w_ref = (float *)malloc((uint64_t)n_tok * n_slot * sizeof(float));
+    int32_t *sel_gpu = (int32_t *)malloc((uint64_t)n_tok * n_slot * sizeof(int32_t));
+    float *w_gpu = (float *)malloc((uint64_t)n_tok * n_slot * sizeof(float));
+
+    for (uint64_t i = 0; i < (uint64_t)n_tok * n_logit; i++)
+        logits[i] = gqa_test_randf() * 4.0f;
+    for (uint32_t e = 0; e < n_expert; e++) bias[e] = gqa_test_randf();
+
+    for (uint32_t t = 0; t < n_tok; t++) {
+        const float *log = logits + (uint64_t)t * n_logit;
+        float score[512];
+        for (uint32_t e = 0; e < n_expert; e++)
+            score[e] = 1.0f / (1.0f + expf(-log[e])) + bias[e];
+        float raw[64];
+        for (uint32_t k = 0; k < k_used; k++) {
+            uint32_t best = UINT32_MAX;
+            for (uint32_t e = 0; e < n_expert; e++) {
+                if (best == UINT32_MAX || score[e] > score[best]) best = e;
+            }
+            sel_ref[(uint64_t)t * n_slot + k] = (int32_t)best;
+            raw[k] = log[best];
+            score[best] = -INFINITY;
+        }
+        for (uint32_t s = 0; s < n_shexp; s++) {
+            sel_ref[(uint64_t)t * n_slot + k_used + s] = (int32_t)(n_expert + s);
+            raw[k_used + s] = log[n_expert + s];
+        }
+        float m = -INFINITY, es = 0.0f;
+        for (uint32_t k = 0; k < n_slot; k++) {
+            /* logsigmoid via double log1p for a tight reference */
+            raw[k] = (float)(-log1p(exp(-(double)raw[k])));
+            m = fmaxf(m, raw[k]);
+        }
+        for (uint32_t k = 0; k < n_slot; k++) es += expf(raw[k] - m);
+        for (uint32_t k = 0; k < n_slot; k++)
+            w_ref[(uint64_t)t * n_slot + k] = expf(raw[k] - m) / es * scale;
+    }
+
+    void *log_dev = NULL, *bias_dev = NULL, *sel_dev = NULL, *w_dev = NULL;
+    const uint64_t log_bytes = (uint64_t)n_tok * n_logit * sizeof(float);
+    const uint64_t bias_bytes = (uint64_t)n_expert * sizeof(float);
+    const uint64_t sel_bytes = (uint64_t)n_tok * n_slot * sizeof(int32_t);
+    const uint64_t w_bytes = (uint64_t)n_tok * n_slot * sizeof(float);
+    int ok = cuda_ok(cudaMalloc(&log_dev, log_bytes), "logits alloc") &&
+             cuda_ok(cudaMalloc(&bias_dev, bias_bytes), "bias alloc") &&
+             cuda_ok(cudaMalloc(&sel_dev, sel_bytes), "sel alloc") &&
+             cuda_ok(cudaMalloc(&w_dev, w_bytes), "w alloc") &&
+             cuda_ok(cudaMemcpy(log_dev, logits, log_bytes, cudaMemcpyHostToDevice), "logits h2d") &&
+             cuda_ok(cudaMemcpy(bias_dev, bias, bias_bytes, cudaMemcpyHostToDevice), "bias h2d") &&
+             pulsar_router_select(sel_dev, w_dev, log_dev, bias_dev,
+                                  n_expert, k_used, scale, n_tok, 2, n_shexp) &&
+             cuda_ok(cudaDeviceSynchronize(), "sync") &&
+             cuda_ok(cudaMemcpy(sel_gpu, sel_dev, sel_bytes, cudaMemcpyDeviceToHost), "sel d2h") &&
+             cuda_ok(cudaMemcpy(w_gpu, w_dev, w_bytes, cudaMemcpyDeviceToHost), "w d2h");
+    float maxd = 0.0f;
+    uint32_t idx_mismatch = 0;
+    if (ok) {
+        for (uint64_t i = 0; i < (uint64_t)n_tok * n_slot; i++) {
+            if (sel_gpu[i] != sel_ref[i]) idx_mismatch++;
+            float d = fabsf(w_gpu[i] - w_ref[i]);
+            if (d > maxd) maxd = d;
+        }
+        ok = idx_mismatch == 0 && maxd <= 1e-5f;
+    }
+    fprintf(stderr,
+            "router-sink-selftest n_expert=%u k=%u shexp=%u: %s (idx mismatches %u, max w diff %.2e)\n",
+            n_expert, k_used, n_shexp, ok ? "PASS" : "FAIL", idx_mismatch,
+            (double)maxd);
+    if (log_dev) cudaFree(log_dev);
+    if (bias_dev) cudaFree(bias_dev);
+    if (sel_dev) cudaFree(sel_dev);
+    if (w_dev) cudaFree(w_dev);
+    free(logits); free(bias); free(sel_ref); free(w_ref); free(sel_gpu); free(w_gpu);
+    return ok;
+}
+
 extern "C" int pulsar_router_selftest(void) {
     /* Hy3-like (64 experts, top-8), GLM-like (256, top-8), odd token
-     * count; qwen3moe-like softmax (128, top-8) + wide softmax (384) */
+     * count; qwen3moe-like softmax (128, top-8) + wide softmax (384);
+     * inkling sink (256 routed + 2 shared, top-6) */
     return router_selftest_one(64, 8, 2.5f, 7, 0) &&
            router_selftest_one(256, 8, 1.0f, 5, 0) &&
            router_selftest_one(96, 6, 1.5f, 1, 0) &&
            router_selftest_one(128, 8, 1.0f, 6, 1) &&
-           router_selftest_one(384, 8, 1.0f, 3, 1);
+           router_selftest_one(384, 8, 1.0f, 3, 1) &&
+           router_sink_selftest_one(256, 6, 2, 8.0f, 5) &&
+           router_sink_selftest_one(64, 4, 1, 1.0f, 3);
 }
 
 /* ---- routed-expert MoE: IQ2_XXS / Q2_K dequant-dot kernels -------------
@@ -3280,6 +3405,126 @@ extern "C" int pulsar_swiglu(
     return cuda_ok(cudaGetLastError(), "swiglu launch");
 }
 
+/* ---- Inkling shortconv: y = x + causal depthwise conv1d over the last K
+ * inputs. x: [n_tok][w] token-major; kern: [w][K] (gguf blk.*.shortconv_*
+ * ne = [K, w], taps contiguous per channel, tap K-1 = current token);
+ * state: [w][K-1] rolling window of the K-1 inputs BEFORE this chunk
+ * (channel-major). out must not alias x. Chunked prefill carries state
+ * across calls; the engine zeroes it at pos 0. */
+__global__ static void sconv_kernel(
+        float *out, const float *x, const float *kern, const float *state,
+        uint32_t n_tok, uint32_t w, uint32_t K) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (uint64_t)n_tok * w) return;
+    const uint32_t c = (uint32_t)(i % w);
+    const uint32_t t = (uint32_t)(i / w);
+    const uint32_t d = K - 1u;
+    const float *kc = kern + (uint64_t)c * K;
+    float acc = 0.0f;
+    for (uint32_t j = 0; j < K; j++) {
+        const int32_t src = (int32_t)(t + j) - (int32_t)d;
+        const float v = src >= 0
+                ? x[(uint64_t)src * w + c]
+                : state[(uint64_t)c * d + (uint32_t)(src + (int32_t)d)];
+        acc += kc[j] * v;
+    }
+    out[i] = x[i] + acc;
+}
+
+/* Roll the state window forward by n_tok columns: new state = last K-1
+ * inputs of (old state ++ x). One thread per channel owns all K-1 columns
+ * in registers, so the in-place shift has no cross-thread hazard. */
+__global__ static void sconv_state_kernel(
+        float *state, const float *x, uint32_t n_tok, uint32_t w, uint32_t K) {
+    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= w) return;
+    const uint32_t d = K - 1u;
+    float nv[7]; /* K <= 8 */
+    for (uint32_t j = 0; j < d; j++) {
+        const int32_t src = (int32_t)(n_tok + j) - (int32_t)d;
+        nv[j] = src >= 0
+                ? x[(uint64_t)src * w + c]
+                : state[(uint64_t)c * d + (uint32_t)(src + (int32_t)d)];
+    }
+    for (uint32_t j = 0; j < d; j++) state[(uint64_t)c * d + j] = nv[j];
+}
+
+extern "C" int pulsar_sconv(
+        void *out_dev, const void *x_dev, const void *kern_dev,
+        void *state_dev, uint32_t n_tok, uint32_t w, uint32_t K) {
+    if (n_tok == 0 || w == 0 || K < 2u || K > 8u || out_dev == x_dev) return 0;
+    const uint64_t total = (uint64_t)n_tok * w;
+    sconv_kernel<<<(uint32_t)((total + 255u) / 256u), 256>>>(
+            (float *)out_dev, (const float *)x_dev, (const float *)kern_dev,
+            (const float *)state_dev, n_tok, w, K);
+    if (!cuda_ok(cudaGetLastError(), "sconv launch")) return 0;
+    sconv_state_kernel<<<(w + 255u) / 256u, 256>>>(
+            (float *)state_dev, (const float *)x_dev, n_tok, w, K);
+    return cuda_ok(cudaGetLastError(), "sconv state launch");
+}
+
+/* Selftest: CPU reference + chunked-vs-single equivalence (state carry). */
+extern "C" int pulsar_sconv_selftest(void) {
+    const uint32_t n_tok = 11, w = 96, K = 4, d = K - 1;
+    float *x = (float *)malloc((uint64_t)n_tok * w * 4);
+    float *kern = (float *)malloc((uint64_t)w * K * 4);
+    float *ref = (float *)malloc((uint64_t)n_tok * w * 4);
+    float *got = (float *)malloc((uint64_t)n_tok * w * 4);
+    float *st_ref = (float *)calloc((uint64_t)w * d, 4);
+    for (uint64_t i = 0; i < (uint64_t)n_tok * w; i++) x[i] = gqa_test_randf();
+    for (uint64_t i = 0; i < (uint64_t)w * K; i++) kern[i] = gqa_test_randf() * 0.5f;
+    /* reference: zero history before t=0 */
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t c = 0; c < w; c++) {
+            float acc = 0.0f;
+            for (uint32_t j = 0; j < K; j++) {
+                const int32_t src = (int32_t)(t + j) - (int32_t)d;
+                acc += kern[(uint64_t)c * K + j] *
+                       (src >= 0 ? x[(uint64_t)src * w + c] : 0.0f);
+            }
+            ref[(uint64_t)t * w + c] = x[(uint64_t)t * w + c] + acc;
+        }
+    }
+    for (uint32_t c = 0; c < w; c++)
+        for (uint32_t j = 0; j < d; j++)
+            st_ref[(uint64_t)c * d + j] = x[(uint64_t)(n_tok - d + j) * w + c];
+
+    void *x_d = NULL, *k_d = NULL, *o_d = NULL, *s_d = NULL;
+    float *st_got = (float *)malloc((uint64_t)w * d * 4);
+    int ok = cuda_ok(cudaMalloc(&x_d, (uint64_t)n_tok * w * 4), "x") &&
+             cuda_ok(cudaMalloc(&k_d, (uint64_t)w * K * 4), "k") &&
+             cuda_ok(cudaMalloc(&o_d, (uint64_t)n_tok * w * 4), "o") &&
+             cuda_ok(cudaMalloc(&s_d, (uint64_t)w * d * 4), "s") &&
+             cuda_ok(cudaMemcpy(x_d, x, (uint64_t)n_tok * w * 4, cudaMemcpyHostToDevice), "x h2d") &&
+             cuda_ok(cudaMemcpy(k_d, kern, (uint64_t)w * K * 4, cudaMemcpyHostToDevice), "k h2d") &&
+             cuda_ok(cudaMemset(s_d, 0, (uint64_t)w * d * 4), "s zero") &&
+             /* chunked: 4 + 1 + 6 tokens, state carries */
+             pulsar_sconv(o_d, x_d, k_d, s_d, 4, w, K) &&
+             pulsar_sconv((char *)o_d + (uint64_t)4 * w * 4,
+                          (const char *)x_d + (uint64_t)4 * w * 4, k_d, s_d, 1, w, K) &&
+             pulsar_sconv((char *)o_d + (uint64_t)5 * w * 4,
+                          (const char *)x_d + (uint64_t)5 * w * 4, k_d, s_d, 6, w, K) &&
+             cuda_ok(cudaDeviceSynchronize(), "sync") &&
+             cuda_ok(cudaMemcpy(got, o_d, (uint64_t)n_tok * w * 4, cudaMemcpyDeviceToHost), "o d2h") &&
+             cuda_ok(cudaMemcpy(st_got, s_d, (uint64_t)w * d * 4, cudaMemcpyDeviceToHost), "s d2h");
+    float maxd = 0.0f;
+    if (ok) {
+        for (uint64_t i = 0; i < (uint64_t)n_tok * w; i++)
+            maxd = fmaxf(maxd, fabsf(got[i] - ref[i]));
+        for (uint64_t i = 0; i < (uint64_t)w * d; i++)
+            maxd = fmaxf(maxd, fabsf(st_got[i] - st_ref[i]));
+        ok = maxd <= 1e-6f;
+    }
+    fprintf(stderr, "sconv-selftest: %s (max diff %.2e)\n",
+            ok ? "PASS" : "FAIL", (double)maxd);
+    if (x_d) cudaFree(x_d);
+    if (k_d) cudaFree(k_d);
+    if (o_d) cudaFree(o_d);
+    if (s_d) cudaFree(s_d);
+    free(x); free(kern); free(ref); free(got); free(st_ref); free(st_got);
+    return ok;
+}
+
 __global__ static void scale_kernel(float *x, uint32_t n, float c) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] *= c;
@@ -3551,11 +3796,14 @@ extern "C" int pulsar_gqa_attention(
         void *out, const void *q, const void *k_cache, const void *v_cache,
         uint32_t n_tok, uint32_t n_head, uint32_t n_kv_head,
         uint32_t head_dim, uint32_t cap, uint32_t pos0,
-        float scale, uint32_t window) {
+        float scale, uint32_t window,
+        const void *rel, uint32_t rel_extent) {
     ds4_gpu_tensor ot = shim(out), qt = shim(q), kt = shim(k_cache),
                    vt = shim(v_cache);
+    ds4_gpu_tensor rt = shim(rel);
     return ds4_gpu_gqa_attention(&ot, &qt, &kt, &vt, n_tok, n_head,
-                                 n_kv_head, head_dim, cap, pos0, scale, window);
+                                 n_kv_head, head_dim, cap, pos0, scale, window,
+                                 rel ? &rt : NULL, rel_extent);
 }
 
 extern "C" int pulsar_gqa_selftest(void) { return ds4_gpu_gqa_selftest(); }
