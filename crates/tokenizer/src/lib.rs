@@ -55,29 +55,115 @@ enum Pre {
 /// Hy3 layout (mirrors ds4's encode_chat_prompt): one turn is
 /// `[bos] [system-text] user <text> assistant think_start think_end`,
 /// and a finished assistant reply is followed by eos in the context.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ChatStyle {
+    /// bos + user-marker text assistant-marker <think></think>
+    Hy3,
+    /// <|im_user|>user<|im_middle|>text<|im_end|> ... (Kimi K2 family)
+    Kimi,
+}
+
 pub struct ChatMarkers {
+    style: ChatStyle,
     pub bos: u32,
     pub eos: u32,
     pub eot: Option<u32>,
-    pub user: u32,
-    pub assistant: u32,
-    pub think_start: u32,
-    pub think_end: u32,
+    user: u32,
+    assistant: u32,
+    /// Hy3: think_start/think_end. Kimi: <|im_middle|> / <|im_system|>.
+    aux0: u32,
+    aux1: u32,
 }
 
 impl ChatMarkers {
     pub fn resolve(t: &Tokenizer) -> Result<ChatMarkers, Error> {
         let find = |s: &'static str| t.find_token(s).ok_or(Error::MissingKey(s));
+        if t.find_token("<|im_middle|>").is_some() {
+            return Ok(ChatMarkers {
+                style: ChatStyle::Kimi,
+                bos: t.bos_id.ok_or(Error::MissingKey("bos_token_id"))?,
+                eos: t.eos_id.ok_or(Error::MissingKey("eos_token_id"))?,
+                eot: t.find_token("<|im_end|>"),
+                user: find("<|im_user|>")?,
+                assistant: find("<|im_assistant|>")?,
+                aux0: find("<|im_middle|>")?,
+                aux1: find("<|im_system|>")?,
+            });
+        }
         Ok(ChatMarkers {
+            style: ChatStyle::Hy3,
             bos: t.bos_id.ok_or(Error::MissingKey("bos_token_id"))?,
             eos: t.eos_id.ok_or(Error::MissingKey("eos_token_id"))?,
             eot: t.eot_id,
             user: find("<｜hy_User:opensource｜>")?,
             assistant: find("<｜hy_Assistant:opensource｜>")?,
-            think_start: find("<think:opensource>")?,
-            think_end: find("</think:opensource>")?,
+            aux0: find("<think:opensource>")?,
+            aux1: find("</think:opensource>")?,
         })
+    }
+
+    /// System text ids for the first turn (Hy3: bare text after bos).
+    pub fn render_system(&self, t: &Tokenizer, text: &str) -> Vec<u32> {
+        match self.style {
+            ChatStyle::Hy3 => t.encode(text),
+            ChatStyle::Kimi => {
+                let mut v = vec![self.aux1];
+                v.extend(t.encode("system"));
+                v.push(self.aux0);
+                v.extend(t.encode(text));
+                v.extend(self.eot);
+                v
+            }
+        }
+    }
+
+    /// A user message (no assistant opener).
+    pub fn render_user(&self, t: &Tokenizer, text: &str) -> Vec<u32> {
+        match self.style {
+            ChatStyle::Hy3 => {
+                let mut v = vec![self.user];
+                v.extend(t.encode(text));
+                v
+            }
+            ChatStyle::Kimi => {
+                let mut v = vec![self.user];
+                v.extend(t.encode("user"));
+                v.push(self.aux0);
+                v.extend(t.encode(text));
+                v.extend(self.eot);
+                v
+            }
+        }
+    }
+
+    /// The assistant opener; generation starts right after it.
+    pub fn open_assistant(&self, t: &Tokenizer) -> Vec<u32> {
+        match self.style {
+            ChatStyle::Hy3 => vec![self.assistant, self.aux0, self.aux1],
+            ChatStyle::Kimi => {
+                let mut v = vec![self.assistant];
+                v.extend(t.encode("assistant"));
+                v.push(self.aux0);
+                // thinking off: close the think block immediately
+                v.extend(t.encode("<think></think>"));
+                v
+            }
+        }
+    }
+
+    /// A completed assistant turn from history (opener + content + stop).
+    pub fn render_assistant_history(&self, t: &Tokenizer, text: &str) -> Vec<u32> {
+        let mut v = self.open_assistant(t);
+        v.extend(t.encode(text));
+        v.push(self.eot.unwrap_or(self.eos));
+        v
+    }
+
+    /// One user turn + assistant opener (generation starts after this).
+    pub fn render_user_turn(&self, t: &Tokenizer, text: &str) -> Vec<u32> {
+        let mut v = self.render_user(t, text);
+        v.extend(self.open_assistant(t));
+        v
     }
 
     pub fn is_stop(&self, id: u32) -> bool {

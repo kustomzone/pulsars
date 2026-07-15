@@ -90,15 +90,11 @@ fn run_chat(
         if first {
             ids.push(markers.bos);
             if let Some(sys) = &system {
-                ids.extend(tok.encode(sys));
+                ids.extend(markers.render_system(tok, sys));
             }
             first = false;
         }
-        ids.push(markers.user);
-        ids.extend(tok.encode(line));
-        ids.push(markers.assistant);
-        ids.push(markers.think_start);
-        ids.push(markers.think_end);
+        ids.extend(markers.render_user_turn(tok, line));
 
         if pos + ids.len() as u32 + 2 >= ctx {
             eprintln!("pulsar chat: context full ({pos}/{ctx}), restart to continue");

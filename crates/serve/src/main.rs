@@ -162,24 +162,13 @@ fn encode_messages(
         let role = msg["role"].as_str().unwrap_or("");
         let content = msg["content"].as_str().unwrap_or("");
         match role {
-            "system" => ids.extend(tok.encode(content)),
-            "user" => {
-                ids.push(m.user);
-                ids.extend(tok.encode(content));
-            }
-            "assistant" => {
-                ids.push(m.assistant);
-                ids.push(m.think_start);
-                ids.push(m.think_end);
-                ids.extend(tok.encode(content));
-                ids.push(m.eos);
-            }
+            "system" => ids.extend(m.render_system(tok, content)),
+            "user" => ids.extend(m.render_user(tok, content)),
+            "assistant" => ids.extend(m.render_assistant_history(tok, content)),
             _ => {}
         }
     }
-    ids.push(m.assistant);
-    ids.push(m.think_start);
-    ids.push(m.think_end);
+    ids.extend(m.open_assistant(tok));
     ids
 }
 
