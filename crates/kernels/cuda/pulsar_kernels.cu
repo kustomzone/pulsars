@@ -2565,9 +2565,9 @@ extern "C" int pulsar_gqa_head_rms_norm(
 
 extern "C" int pulsar_gqa_rope(
         void *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
-        uint32_t pos0, float theta) {
+        uint32_t rot_dim, uint32_t pos0, float theta) {
     ds4_gpu_tensor xt = shim(x);
-    return ds4_gpu_gqa_rope(&xt, n_tok, n_head, head_dim, pos0, theta);
+    return ds4_gpu_gqa_rope(&xt, n_tok, n_head, head_dim, rot_dim, pos0, theta);
 }
 
 extern "C" int pulsar_gqa_kv_append(

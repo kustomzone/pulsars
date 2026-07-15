@@ -62,6 +62,9 @@ mod real {
         pub qk_rope: u32,
         pub value_mla: u32,
         pub rope_orig_ctx: u32,
+        /// GQA rotary width (partial rotary when < head_dim; MiniMax M3
+        /// rotates 64 of 128). Hy3 rotates the full head.
+        pub rot_dim: u32,
         // DSA lightning indexer (zero when absent -> ctx capped at 2048)
         pub n_idx_head: u32,
         pub n_idx_dim: u32,
@@ -127,6 +130,9 @@ mod real {
                 // "hy-v3"; upstream llama.cpp (and AngelSlim's converter)
                 // write "hy_v3". Same model either way.
                 Some("hy-v3") | Some("hy_v3") => Family::Gqa,
+                // MiniMax M3: Hy3-shaped GQA MoE (shexp, sigmoid router)
+                // with partial rotary (rope.dimension_count < head_dim)
+                Some("minimax-m3") | Some("minimax-m2") => Family::Gqa,
                 Some("glm-dsa") | Some("glm_dsa") => Family::Mla,
                 // DeepSeek-V3 family (Kimi K2 etc.): plain MLA, no indexer
                 Some("deepseek2") => Family::Mla,
@@ -169,12 +175,18 @@ mod real {
                 qk_rope: 0,
                 value_mla: 0,
                 rope_orig_ctx: 0,
+                rot_dim: 0,
                 n_idx_head: 0,
                 n_idx_dim: 0,
                 n_idx_topk: 0,
                 rope_scale_factor: 1.0,
                 rope_yarn_log_mult: 0.0,
             };
+            if family == Family::Gqa {
+                // partial rotary: MiniMax rotates rope.dimension_count of
+                // head_dim; absent (Hy3) = full head
+                s.rot_dim = u("rope.dimension_count").unwrap_or(s.head_dim);
+            }
             if family == Family::Mla {
                 // GLM-5.2 MLA split from the gguf's own keys (verified
                 // against the production glm-dsa file + DS4_SHAPE_GLM52):
@@ -2027,8 +2039,8 @@ mod real {
                         kernels::matmul_q8_0(&mut st.v, attn_v, &st.normed, s.n_embd, s.n_head_kv * s.head_dim, n_tok)?;
                         kernels::gqa_head_rms_norm(&mut st.q, q_norm, n_tok * s.n_head, s.head_dim, eps)?;
                         kernels::gqa_head_rms_norm(&mut st.k, k_norm, n_tok * s.n_head_kv, s.head_dim, eps)?;
-                        kernels::gqa_rope(&mut st.q, n_tok, s.n_head, s.head_dim, pos0, s.rope_freq_base)?;
-                        kernels::gqa_rope(&mut st.k, n_tok, s.n_head_kv, s.head_dim, pos0, s.rope_freq_base)?;
+                        kernels::gqa_rope(&mut st.q, n_tok, s.n_head, s.head_dim, s.rot_dim, pos0, s.rope_freq_base)?;
+                        kernels::gqa_rope(&mut st.k, n_tok, s.n_head_kv, s.head_dim, s.rot_dim, pos0, s.rope_freq_base)?;
                         kernels::gqa_kv_append(&mut st.kcache[il], &st.k, n_tok, s.n_head_kv, s.head_dim, st.ctx, pos0)?;
                         kernels::gqa_kv_append(&mut st.vcache[il], &st.v, n_tok, s.n_head_kv, s.head_dim, st.ctx, pos0)?;
                         kernels::gqa_attention(&mut st.heads, &st.q, &st.kcache[il], &st.vcache[il], n_tok, s.n_head, s.n_head_kv, s.head_dim, st.ctx, pos0)?;

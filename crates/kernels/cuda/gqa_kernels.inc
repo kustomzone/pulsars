@@ -56,9 +56,10 @@ __global__ static void gqa_rope_neox_kernel(
         uint32_t n_tok,
         uint32_t n_head,
         uint32_t head_dim,
+        uint32_t rot_dim, /* partial rotary: rotate first rot_dim dims */
         uint32_t pos0,
         float theta) {
-    uint32_t half = head_dim / 2u;
+    uint32_t half = rot_dim / 2u;
     uint64_t total = (uint64_t)n_tok * n_head * half;
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= total) return;
@@ -67,7 +68,7 @@ __global__ static void gqa_rope_neox_kernel(
     uint32_t h = rem % n_head;
     uint32_t t = rem / n_head;
     float *v = x + ((uint64_t)t * n_head + h) * head_dim;
-    float freq = powf(theta, -2.0f * (float)d / (float)head_dim);
+    float freq = powf(theta, -2.0f * (float)d / (float)rot_dim);
     float ang = (float)(pos0 + t) * freq;
     float c = cosf(ang), s = sinf(ang);
     float a = v[d], b = v[d + half];
@@ -185,11 +186,12 @@ extern "C" int ds4_gpu_gqa_head_rms_norm_weight(
 
 extern "C" int ds4_gpu_gqa_rope(
         ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head,
-        uint32_t head_dim, uint32_t pos0, float theta) {
-    if (!x || n_tok == 0 || n_head == 0 || head_dim == 0 || head_dim % 2u) return 0;
-    uint64_t total = (uint64_t)n_tok * n_head * (head_dim / 2u);
+        uint32_t head_dim, uint32_t rot_dim, uint32_t pos0, float theta) {
+    if (!x || n_tok == 0 || n_head == 0 || head_dim == 0 || rot_dim == 0 ||
+        rot_dim > head_dim || rot_dim % 2u) return 0;
+    uint64_t total = (uint64_t)n_tok * n_head * (rot_dim / 2u);
     gqa_rope_neox_kernel<<<(uint32_t)((total + 255u) / 256u), 256>>>(
-            (float *)x->ptr, n_tok, n_head, head_dim, pos0, theta);
+            (float *)x->ptr, n_tok, n_head, head_dim, rot_dim, pos0, theta);
     return cuda_ok(cudaGetLastError(), "gqa rope launch");
 }
 

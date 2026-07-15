@@ -49,6 +49,7 @@ enum Pre {
     /// ChatGLM4/GLM llama3-style split ("glm4").
     Glm4,
     KimiK2,
+    MiniMax,
 }
 
 /// The special-token ids a chat loop needs, resolved from the vocab.
@@ -229,6 +230,7 @@ impl Tokenizer {
             pre: match g.metadata.get("tokenizer.ggml.pre").and_then(Value::as_str) {
                 Some("glm4") => Pre::Glm4,
                 Some("kimi-k2") => Pre::KimiK2,
+                Some("minimax-m2") => Pre::MiniMax,
                 _ => Pre::JoyAi,
             },
         })
@@ -257,6 +259,7 @@ impl Tokenizer {
             Pre::JoyAi => pretokenize(text.as_bytes()),
             Pre::Glm4 => pretokenize_glm4(text.as_bytes()),
             Pre::KimiK2 => pretokenize_kimi_k2(text.as_bytes()),
+            Pre::MiniMax => pretokenize_minimax(text.as_bytes()),
         };
         for piece in pieces {
             self.bpe_piece(piece, &mut out);
@@ -589,6 +592,98 @@ fn kimi_is_han(cp: u32) -> bool {
 /// Han runs split alone; letter runs EXCLUDE Han, may take one leading
 /// non-letter/non-number char and attach an English contraction; the
 /// digit/punct/whitespace tail matches glm4 exactly.
+
+/// minimax-m2/m3 pre-tokenizer: kimi-k2's letter/contraction/digit/ws
+/// rules WITHOUT the Han split (Han joins letter runs), and punct runs
+/// absorb trailing '/' as well as newlines.
+fn pretokenize_minimax(s: &[u8]) -> Vec<&[u8]> {
+    let len = s.len();
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < len {
+        let start = pos;
+        let cur = glm4_char_at(s, pos);
+        if !cur.valid {
+            break;
+        }
+        let leading_ok = !(cur.cp == 0x0d || cur.cp == 0x0a || cur.is_letter || cur.is_number);
+        let next = glm4_char_at(s, cur.next);
+        if cur.is_letter || (leading_ok && next.valid && next.is_letter) {
+            pos = cur.next;
+            while pos < len {
+                let scan = glm4_char_at(s, pos);
+                if !scan.valid || !scan.is_letter {
+                    break;
+                }
+                pos = scan.next;
+            }
+            let ap = glm4_char_at(s, pos);
+            if ap.valid && ap.cp == 0x27 && ap.next < len {
+                let n1c = glm4_char_at(s, ap.next);
+                let n1 = ascii_lower(n1c.cp);
+                if matches!(n1, 0x73 | 0x74 | 0x6d | 0x64) {
+                    pos = n1c.next;
+                } else if n1c.valid && n1c.next < len {
+                    let n2c = glm4_char_at(s, n1c.next);
+                    let n2 = ascii_lower(n2c.cp);
+                    if (n1 == 0x72 && n2 == 0x65) || (n1 == 0x76 && n2 == 0x65) || (n1 == 0x6c && n2 == 0x6c) {
+                        pos = n2c.next;
+                    }
+                }
+            }
+            out.push(&s[start..pos]);
+            continue;
+        }
+        if cur.is_number {
+            let mut nd = 0;
+            while pos < len && nd < 3 {
+                let scan = glm4_char_at(s, pos);
+                if !scan.valid || !scan.is_number {
+                    break;
+                }
+                pos = scan.next;
+                nd += 1;
+            }
+            out.push(&s[start..pos]);
+            continue;
+        }
+        let (mut punct, punct_pos) = if cur.cp == 0x20 {
+            (glm4_char_at(s, cur.next), cur.next)
+        } else {
+            (cur, pos)
+        };
+        punct.valid = punct.valid && punct_pos < len;
+        if punct.valid && !punct.is_whitespace && !punct.is_letter && !punct.is_number {
+            pos = punct_pos;
+            while pos < len {
+                let scan = glm4_char_at(s, pos);
+                if !scan.valid || scan.is_whitespace || scan.is_letter || scan.is_number {
+                    break;
+                }
+                pos = scan.next;
+            }
+            // trailing newlines AND slashes
+            while pos < len {
+                let scan = glm4_char_at(s, pos);
+                if !scan.valid || !(scan.cp == 0x0d || scan.cp == 0x0a || scan.cp == 0x2f) {
+                    break;
+                }
+                pos = scan.next;
+            }
+            out.push(&s[start..pos]);
+            continue;
+        }
+        if cur.is_whitespace {
+            pos = glm4_whitespace_segment(s, pos, len);
+            out.push(&s[start..pos]);
+            continue;
+        }
+        pos = cur.next;
+        out.push(&s[start..pos]);
+    }
+    out
+}
+
 fn pretokenize_kimi_k2(s: &[u8]) -> Vec<&[u8]> {
     let len = s.len();
     let mut out = Vec::new();

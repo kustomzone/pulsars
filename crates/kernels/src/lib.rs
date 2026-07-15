@@ -86,7 +86,7 @@ mod real {
         fn pulsar_moe_down_grouped(partial: *mut c_void, gptrs: *const c_void, starts: *const c_void, pairs: *const c_void, midq: *const c_void, mid_dim: u32, out_dim: u32, n_used: u32, n_group: u32, row_bytes: u64, quant: u32) -> i32;
         fn pulsar_moe_slot_sum(out: *mut c_void, partial: *const c_void, out_dim: u32, n_used: u32, n_tok: u32) -> i32;
         fn pulsar_gqa_head_rms_norm(x: *mut c_void, w: *const c_void, rows: u32, head_dim: u32, eps: f32) -> i32;
-        fn pulsar_gqa_rope(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, pos0: u32, theta: f32) -> i32;
+        fn pulsar_gqa_rope(x: *mut c_void, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, theta: f32) -> i32;
         fn pulsar_gqa_kv_append(cache: *mut c_void, kv: *const c_void, n_tok: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32) -> i32;
         fn pulsar_gqa_attention(out: *mut c_void, q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, n_tok: u32, n_head: u32, n_kv_head: u32, head_dim: u32, cap: u32, pos0: u32) -> i32;
 
@@ -728,8 +728,8 @@ mod real {
         check(unsafe { pulsar_gqa_head_rms_norm(x.ptr_mut(), w.ptr(), rows, head_dim, eps) }, "gqa_head_rms_norm")
     }
 
-    pub fn gqa_rope(x: &mut DeviceBuf, n_tok: u32, n_head: u32, head_dim: u32, pos0: u32, theta: f32) -> Result {
-        check(unsafe { pulsar_gqa_rope(x.ptr_mut(), n_tok, n_head, head_dim, pos0, theta) }, "gqa_rope")
+    pub fn gqa_rope(x: &mut DeviceBuf, n_tok: u32, n_head: u32, head_dim: u32, rot_dim: u32, pos0: u32, theta: f32) -> Result {
+        check(unsafe { pulsar_gqa_rope(x.ptr_mut(), n_tok, n_head, head_dim, rot_dim, pos0, theta) }, "gqa_rope")
     }
 
     #[allow(clippy::too_many_arguments)]
