@@ -405,7 +405,7 @@ extern "C" int pulsar_q8_0_matmul_selftest(void) {
  * Hy3 router mirrors GLM: probs = sigmoid(logits), selection score =
  * prob + bias, route weights = selected probs normalized * scale).
  * pulsar contract: bias is an explicit device pointer, not a model-map
- * offset. n_expert <= 256, k_used <= n_expert. */
+ * offset. n_expert <= 512 (templated register tiling), k_used <= n_expert. */
 
 __device__ __forceinline__ static float router_sigmoid(float x) {
     if (x >= 0.0f) {
@@ -421,6 +421,7 @@ __device__ __forceinline__ static bool router_better(
     return av > bv || (av == bv && ai < bi);
 }
 
+template <uint32_t J>
 __global__ static void router_select_kernel(
         int32_t *selected,         /* [n_tok][k_used] */
         float *weights,            /* [n_tok][k_used] */
@@ -438,10 +439,10 @@ __global__ static void router_select_kernel(
     int32_t *sel = selected + (uint64_t)token * k_used;
     float *w = weights + (uint64_t)token * k_used;
 
-    float local_prob[8];
-    float local_score[8];
+    float local_prob[J];
+    float local_score[J];
     #pragma unroll
-    for (uint32_t j = 0; j < 8u; j++) {
+    for (uint32_t j = 0; j < J; j++) {
         const uint32_t e = lane + j * 32u;
         if (e < n_expert) {
             const float p = router_sigmoid(log[e]);
@@ -460,7 +461,7 @@ __global__ static void router_select_kernel(
         float best_prob = 0.0f;
         uint32_t best_idx = UINT32_MAX;
         #pragma unroll
-        for (uint32_t j = 0; j < 8u; j++) {
+        for (uint32_t j = 0; j < J; j++) {
             const uint32_t e = lane + j * 32u;
             if (router_better(local_score[j], e, best_score, best_idx)) {
                 best_score = local_score[j];
@@ -480,7 +481,7 @@ __global__ static void router_select_kernel(
             }
         }
         #pragma unroll
-        for (uint32_t j = 0; j < 8u; j++) {
+        for (uint32_t j = 0; j < J; j++) {
             if (lane + j * 32u == best_idx) local_score[j] = -INFINITY;
         }
         if (lane == 0) {
@@ -505,12 +506,19 @@ extern "C" int pulsar_router_select(
         uint32_t k_used,
         float weight_scale,
         uint32_t n_tok) {
-    if (n_expert == 0 || n_expert > 256u || k_used == 0 || k_used > n_expert ||
+    if (n_expert == 0 || n_expert > 512u || k_used == 0 || k_used > n_expert ||
         n_tok == 0) {
         return 0;
     }
     dim3 block(32, 4, 1);
-    router_select_kernel<<<(n_tok + 3u) / 4u, block>>>(
+    if (n_expert > 256u) {
+        router_select_kernel<16><<<(n_tok + 3u) / 4u, block>>>(
+                (int32_t *)selected_dev, (float *)weights_dev,
+                (const float *)logits_dev, (const float *)bias_dev,
+                n_expert, k_used, weight_scale, n_tok);
+        return cuda_ok(cudaGetLastError(), "router select launch");
+    }
+    router_select_kernel<8><<<(n_tok + 3u) / 4u, block>>>(
             (int32_t *)selected_dev, (float *)weights_dev,
             (const float *)logits_dev, (const float *)bias_dev,
             n_expert, k_used, weight_scale, n_tok);
