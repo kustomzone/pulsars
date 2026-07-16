@@ -26,7 +26,7 @@ day after release); code-complete, first run pending: **Qwen3-235B/30B**
 | decode | pulsar | reference engine (same box) |
 |---|---|---|
 | Kimi K2.7-Code 1T (339GB, 8-shard split gguf) | **1.3 tok/s** | – |
-| TML Inkling 1T (317GB, 8-shard split gguf) | **1.15 tok/s** | – |
+| TML Inkling 1T (317GB, 8-shard split gguf) | **1.5 tok/s** | – |
 | Hy3 295B (85GB gguf) | **7.2 tok/s** | 0.64–0.70 (ds4) |
 | Gemma 4 26B-A4B (17GB gguf) | **36 tok/s** | – |
 | GLM-5.2 743B (197GB gguf) | **2.0 tok/s** | 0.40 (ds4) |
