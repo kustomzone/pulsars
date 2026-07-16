@@ -16,6 +16,7 @@
 #[cfg(target_os = "linux")]
 mod real {
     mod dsv4;
+    mod qwen35;
 
     use std::fs::File;
     use std::os::unix::fs::FileExt;
@@ -43,6 +44,12 @@ mod real {
         /// Decode-only graph; prefill loops tokens (the compressor and
         /// SWA ring are sequential state machines).
         Dsv4,
+        /// Qwen3.5/3.6 MoE hybrid (qwen35moe): Gated DeltaNet linear
+        /// attention on 3 of 4 layers (O(1) recurrent state, no KV),
+        /// sigmoid-gated full attention on the rest. Decode-only graph;
+        /// prefill loops tokens (conv window + delta state are
+        /// sequential).
+        Qwen35,
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -102,6 +109,13 @@ mod real {
         pub hc_eps: f32,
         pub compress_rope_base: f32,
         pub n_out_group: u32,
+        // qwen35moe GDN (zero elsewhere)
+        pub ssm_conv_k: u32,
+        pub ssm_state: u32,
+        pub ssm_k_heads: u32,
+        pub ssm_v_heads: u32,
+        pub ssm_inner: u32,
+        pub full_attn_interval: u32,
         /// SwiGLU clamp for routed AND shared experts (10.0 on V4;
         /// the per-layer metadata array is constant per model)
         pub clamp_exp: f32,
@@ -115,7 +129,7 @@ mod real {
         /// Attention output width (input of attn_output).
         fn heads_dim(&self) -> u32 {
             match self.family {
-                Family::Gqa | Family::Dsv4 => self.n_head * self.head_dim,
+                Family::Gqa | Family::Dsv4 | Family::Qwen35 => self.n_head * self.head_dim,
                 Family::Mla => self.n_head * self.value_mla,
             }
         }
@@ -191,6 +205,8 @@ mod real {
                 // DeepSeek-V4-Flash: hyper-connections + sink attention +
                 // compressed KV + hash routing (task #22)
                 Some("deepseek4") => Family::Dsv4,
+                // Qwen3.6-35B-A3B hybrid GDN (task #21)
+                Some("qwen35moe") => Family::Qwen35,
                 other => return Err(format!("unsupported architecture {other:?}").into()),
             };
             let inkling = g.architecture() == Some("inkling");
@@ -241,16 +257,19 @@ mod real {
                 n_expert: u("expert_count")?,
                 n_expert_used: u("expert_used_count")?,
                 n_ff_exp: u("expert_feed_forward_length")?,
-                // deepseek4 has no dense FFN layers and omits the key
+                // deepseek4/qwen35moe have no dense FFN layers and omit the key
                 n_ff_dense: match family {
-                    Family::Dsv4 => u("feed_forward_length")
+                    Family::Dsv4 | Family::Qwen35 => u("feed_forward_length")
                         .unwrap_or(u("expert_feed_forward_length")?),
                     _ => u("feed_forward_length")?,
                 },
                 n_vocab,
                 // absent on qwen3moe (no scaling) - default 1.0
                 expert_weight_scale: f("expert_weights_scale").unwrap_or(1.0),
-                router_softmax: matches!(g.architecture(), Some("qwen3moe") | Some("gemma4")),
+                router_softmax: matches!(
+                    g.architecture(),
+                    Some("qwen3moe") | Some("gemma4") | Some("qwen35moe")
+                ),
                 // gated-FFN op: 1 = gelu (gemma4), 2 = swiglu_oai (MiniMax
                 // M3: clamp 7, alpha 1.702, up+1 - llama.cpp PR 24523),
                 // 0 = plain silu everywhere else (inkling included)
@@ -291,6 +310,12 @@ mod real {
                 compress_rope_base: 0.0,
                 n_out_group: 0,
                 clamp_exp: 0.0,
+                ssm_conv_k: 0,
+                ssm_state: 0,
+                ssm_k_heads: 0,
+                ssm_v_heads: 0,
+                ssm_inner: 0,
+                full_attn_interval: 0,
             };
             if family == Family::Gqa {
                 // partial rotary: MiniMax rotates rope.dimension_count of
@@ -325,6 +350,15 @@ mod real {
                 s.n_idx_topk = u("attention.indexer.top_k").unwrap_or(0);
                 s.rope_scale_factor = f("rope.scaling.factor").unwrap_or(1.0);
                 s.rope_yarn_log_mult = f("rope.scaling.yarn_log_multiplier").unwrap_or(0.0);
+            }
+            if family == Family::Qwen35 {
+                s.rot_dim = u("rope.dimension_count").unwrap_or(64);
+                s.ssm_conv_k = u("ssm.conv_kernel").unwrap_or(4);
+                s.ssm_state = u("ssm.state_size").unwrap_or(128);
+                s.ssm_k_heads = u("ssm.group_count").unwrap_or(16);
+                s.ssm_v_heads = u("ssm.time_step_rank").unwrap_or(32);
+                s.ssm_inner = u("ssm.inner_size").unwrap_or(4096);
+                s.full_attn_interval = u("full_attention_interval").unwrap_or(4);
             }
             if family == Family::Dsv4 {
                 s.n_lora_q = u("attention.q_lora_rank").unwrap_or(1024);
@@ -501,6 +535,41 @@ mod real {
             indexer: Option<IdxW>,
         },
         Dsv4(Box<Dsv4W>),
+        Qwen35(Box<Qwen35W>),
+    }
+
+    /// qwen35moe per-layer stack: exactly one of attn/gdn is Some.
+    /// The MoE half reuses Ffn::Moe; LayerW.attn_norm doubles as the
+    /// pre-attention norm and LayerW.ffn_norm as post_attention_norm.
+    struct Qwen35W {
+        attn: Option<Qwen35Attn>,
+        gdn: Option<Qwen35Gdn>,
+        /// shared-expert scalar gate weight, f32 [n_embd -> 1]
+        shexp_gate: DeviceBuf,
+    }
+
+    /// Full-attention layer (every full_attn_interval-th): the q
+    /// projection is fused per head [q head_dim | gate head_dim].
+    struct Qwen35Attn {
+        wq: DeviceBuf, // q8_0 [n_embd -> 2*n_head*head_dim]
+        wk: DeviceBuf, // q8_0 [n_embd -> n_kv*head_dim]
+        wv: DeviceBuf,
+        q_norm: DeviceBuf, // f32 [head_dim]
+        k_norm: DeviceBuf,
+    }
+
+    /// Gated DeltaNet layer: conv window + delta-rule state, no KV.
+    struct Qwen35Gdn {
+        wqkv: DeviceBuf, // q8_0 [n_embd -> 2*key_dim + value_dim]
+        wz: DeviceBuf,   // q8_0 [n_embd -> value_dim] (attn_gate)
+        conv: DeviceBuf, // f32 [conv_dim][ssm_conv_k]
+        alpha_w: DeviceBuf, // f32 [n_embd -> ssm_v_heads]
+        beta_w: DeviceBuf,
+        /// host: g = a * softplus(alpha + dt_bias); a stored as -exp(A_log)
+        a: Vec<f32>,
+        dt_bias: Vec<f32>,
+        ssm_norm: DeviceBuf, // f32 [ssm_state] per-v-head gated rms weight
+        ssm_out: DeviceBuf,  // q8_0 [value_dim -> n_embd]
     }
 
     /// deepseek4 per-layer stack: V4 attention, hyper-connection
@@ -1559,9 +1628,9 @@ mod real {
                         ok
                     }),
                 },
-                // ponytail: dsv4 v1 runs everything on the primary; attn
-                // offload comes with the perf pass
-                Family::Dsv4 => None,
+                // ponytail: dsv4/qwen35 v1 run everything on the primary;
+                // attn offload comes with the perf pass
+                Family::Dsv4 | Family::Qwen35 => None,
             };
             if let Some(d) = attn_dev {
                 eprintln!("pulsar: attn weights + KV resident on CUDA device {d}");
@@ -1683,6 +1752,8 @@ mod real {
                 // V4's attn+compressor+indexer q8 stack is ~6GB total;
                 // resident on a 16GB card still leaves an expert cache
                 (Family::Dsv4, _) => env_budget.unwrap_or(8 << 30),
+                // qwen35: the whole non-expert stack is ~2GB - resident
+                (Family::Qwen35, _) => env_budget.unwrap_or(i64::MAX),
             };
             // small Mla attn tensors always go pinned (not worth budget) -
             // except on a dedicated attn GPU, where everything is resident
@@ -1917,10 +1988,47 @@ mod real {
                             ratio,
                         }))
                     }
+                    Family::Qwen35 => {
+                        let is_attn = (il + 1) % shape.full_attn_interval == 0;
+                        Attn::Qwen35(Box::new(Qwen35W {
+                            attn: if is_attn {
+                                Some(Qwen35Attn {
+                                    wq: upload(&file, &gguf, &t("attn_q.weight"))?,
+                                    wk: upload(&file, &gguf, &t("attn_k.weight"))?,
+                                    wv: upload(&file, &gguf, &t("attn_v.weight"))?,
+                                    q_norm: upload(&file, &gguf, &t("attn_q_norm.weight"))?,
+                                    k_norm: upload(&file, &gguf, &t("attn_k_norm.weight"))?,
+                                })
+                            } else {
+                                None
+                            },
+                            gdn: if is_attn {
+                                None
+                            } else {
+                                Some(Qwen35Gdn {
+                                    wqkv: upload(&file, &gguf, &t("attn_qkv.weight"))?,
+                                    wz: upload(&file, &gguf, &t("attn_gate.weight"))?,
+                                    conv: upload(&file, &gguf, &t("ssm_conv1d.weight"))?,
+                                    alpha_w: upload(&file, &gguf, &t("ssm_alpha.weight"))?,
+                                    beta_w: upload(&file, &gguf, &t("ssm_beta.weight"))?,
+                                    a: read_tensor_f32(&file, &gguf, &t("ssm_a"))?,
+                                    dt_bias: read_tensor_f32(&file, &gguf, &t("ssm_dt.bias"))?,
+                                    ssm_norm: upload(&file, &gguf, &t("ssm_norm.weight"))?,
+                                    ssm_out: upload(&file, &gguf, &t("ssm_out.weight"))?,
+                                })
+                            },
+                            shexp_gate: upload(&file, &gguf, &t("ffn_gate_inp_shexp.weight"))?,
+                        }))
+                    }
                 };
                 let attn_output = if dsv4_arch {
                     // V4's second-stage output projection
                     upload_attn(&file, &gguf, &t("attn_output_b.weight"), &mut *attn_vram_budget)?
+                } else if shape.family == Family::Qwen35
+                    && gguf.tensor(&t("attn_output.weight")).is_none()
+                {
+                    // GDN layers project through ssm_out instead
+                    DeviceBuf::alloc(1)?
                 } else {
                     upload_attn(&file, &gguf, &t("attn_output.weight"), &mut *attn_vram_budget)?
                 };
@@ -2011,7 +2119,12 @@ mod real {
                     attn_norm: upload(&file, &gguf, &t("attn_norm.weight"))?,
                     attn,
                     attn_output,
-                    ffn_norm: upload(&file, &gguf, &t("ffn_norm.weight"))?,
+                    // qwen35 calls the pre-FFN norm post_attention_norm
+                    ffn_norm: if gguf.tensor(&t("ffn_norm.weight")).is_some() {
+                        upload(&file, &gguf, &t("ffn_norm.weight"))?
+                    } else {
+                        upload(&file, &gguf, &t("post_attention_norm.weight"))?
+                    },
                     ffn,
                     gemma,
                     ink,
@@ -2174,9 +2287,9 @@ mod real {
         if std::env::var("PULSAR_TIERS").ok().as_deref() == Some("off") {
             return Ok(Vec::new());
         }
-        if s.family == Family::Dsv4 {
-            // ponytail: the dsv4 resolve doesn't consult tiers yet -
-            // loading them would park dead weight on the other card
+        if matches!(s.family, Family::Dsv4 | Family::Qwen35) {
+            // ponytail: the lean hybrid-family resolve doesn't consult
+            // tiers yet - loading them would park dead weight
             return Ok(Vec::new());
         }
         // dedicated cards first; the attn card joins LAST with whatever
@@ -2414,6 +2527,8 @@ mod real {
         unified: bool,
         /// deepseek4 runtime (HC streams, compressor state); None elsewhere
         dsv4: Option<dsv4::Dsv4Rt>,
+        /// qwen35 runtime (GDN conv+delta states); None elsewhere
+        qwen35: Option<qwen35::Qwen35Rt>,
     }
 
     impl State {
@@ -2600,6 +2715,10 @@ mod real {
                 // raw SWA ring in kcache; the compressed-row cache rides
                 // vcache, sized per layer in the loop below
                 Family::Dsv4 => (s.n_swa as usize * s.head_dim as usize * 4, 4),
+                Family::Qwen35 => {
+                    let b = s.n_head_kv as usize * ctx as usize * kv_row(s.head_dim as usize);
+                    (b, b)
+                }
             };
             if kv_fp8 {
                 let full = s.n_head_kv as usize * ctx as usize * s.head_dim as usize * 4;
@@ -2642,7 +2761,14 @@ mod real {
             for i in 0..n_kv_slots {
                 // per-layer geometry (gemma4): a SWA layer's cache is its
                 // own kv width, not the Shape max
-                let (kb, vb) = if s.family == Family::Dsv4 {
+                let (kb, vb) = if s.family == Family::Qwen35 {
+                    // only full-attention layers hold KV
+                    if (i as u32 + 1) % s.full_attn_interval == 0 {
+                        (k_bytes, v_bytes)
+                    } else {
+                        (4, 4)
+                    }
+                } else if s.family == Family::Dsv4 {
                     let ratio = m.compress_ratios.get(i).copied().unwrap_or(0) as usize;
                     let comp = if ratio > 0 {
                         (ctx as usize / ratio + 2) * s.head_dim as usize * 4
@@ -2875,6 +3001,11 @@ mod real {
                 } else {
                     None
                 },
+                qwen35: if s.family == Family::Qwen35 {
+                    Some(qwen35::Qwen35Rt::new(m)?)
+                } else {
+                    None
+                },
             };
 
             // ---- capacity solver: size the VRAM budget from MEASUREMENT.
@@ -3002,6 +3133,10 @@ mod real {
                 // V4 is a sequential state machine (SWA ring, streaming
                 // compressor): prefill loops single-token forwards
                 return self.forward_dsv4(st, tokens, pos0, rows);
+            }
+            if s.family == Family::Qwen35 {
+                // GDN conv window + delta state are sequential too
+                return self.forward_qwen35(st, tokens, pos0, rows);
             }
             // a batch must not straddle the indexer top_k boundary: rows
             // before it use causal range selection, rows after it need
@@ -3137,8 +3272,10 @@ mod real {
                 kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, n_tok, eps)?;
                 let mut attn_output_w: &DeviceBuf = &l.attn_output;
                 match &l.attn {
-                    // dsv4 has its own graph (forward_dsv4/eval_dsv4_layer)
-                    Attn::Dsv4(_) => return Err("dsv4 layer in the shared eval path".into()),
+                    // dsv4/qwen35 have their own graphs
+                    Attn::Dsv4(_) | Attn::Qwen35(_) => {
+                        return Err("hybrid-family layer in the shared eval path".into())
+                    }
                     Attn::Gqa { attn_q, attn_k, attn_v, q_norm, k_norm } => {
                         let (hkv, hd, theta, window) = match gm {
                             Some(g) => (g.n_head_kv, g.head_dim, g.theta, g.window),

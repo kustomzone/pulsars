@@ -887,7 +887,7 @@ impl Model {
             kernels::zero(&mut st.shared_out, s.n_embd as usize * 4)?;
         }
         kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, 1)?;
-        self.dsv4_moe(st, &selected, gate_exps, up_exps, down_exps)?;
+        self.dsv4_moe(st, &selected, gate_exps, up_exps, down_exps, 3)?;
         kernels::add(&mut st.ffn_out, &st.moe_out, &st.shared_out, s.n_embd)?;
         self.dsv4_hc_post(rt, &st.ffn_out, &post, &comb_k)?;
         Ok(())
@@ -897,7 +897,7 @@ impl Model {
     /// the shared Moe arm: VRAM cache -> host LFU -> io_uring, staged
     /// per-slab. ponytail: no tiers/prefetch/grouped here; unify with
     /// eval_layer's resolve when the dsv4 perf pass starts.
-    fn dsv4_moe(&self, st: &mut State, selected: &[i32], gate_exps: &super::ExpertTensor, up_exps: &super::ExpertTensor, down_exps: &super::ExpertTensor) -> Result {
+    pub(super) fn dsv4_moe(&self, st: &mut State, selected: &[i32], gate_exps: &super::ExpertTensor, up_exps: &super::ExpertTensor, down_exps: &super::ExpertTensor, act_op: u32) -> Result {
         let s = self.shape;
         let mut distinct: Vec<i32> = selected
             .iter()
@@ -971,11 +971,11 @@ impl Model {
             });
         }
         st.expert_ptrs.write(0, kernels::as_bytes(&ptrs))?;
-        // act_op 3 = deepseek4 clamped silu (clamp 10); router weight
-        // applies before the down projection, ds4's exact order
+        // router weight applies before the down projection (ds4 order);
+        // act_op 3 = deepseek4 clamped silu, 0 = plain silu (qwen35)
         kernels::moe_pair_swiglu(
             &mut st.moe_mid, &st.expert_ptrs, &st.router_weights, &st.xq,
-            s.n_embd, s.n_ff_exp, s.n_expert_used, 1, gate_exps.row_bytes, gate_exps.quant, 3,
+            s.n_embd, s.n_ff_exp, s.n_expert_used, 1, gate_exps.row_bytes, gate_exps.quant, act_op,
         )?;
         kernels::quantize_q8_k(&mut st.midq, &st.moe_mid, s.n_ff_exp, s.n_expert_used)?;
         kernels::moe_down(

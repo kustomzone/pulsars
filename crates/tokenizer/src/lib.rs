@@ -470,6 +470,11 @@ impl Tokenizer {
                     // letter runs); identical on ASCII/precomposed text
                     Some("inkling") => Pre::MiniMax,
                     Some("qwen2") => Pre::Qwen2,
+                    // qwen35 = qwen2 with \p{M} joined to the letter
+                    // classes; pulsar's classifier already treats marks
+                    // as letters (non-ws/non-digit/non-punct), so the
+                    // qwen2 splitter IS the qwen35 splitter here
+                    Some("qwen35") => Pre::Qwen2,
                     _ => Pre::JoyAi,
                 }
             },
