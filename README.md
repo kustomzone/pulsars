@@ -23,22 +23,33 @@ day after release); code-complete, first run pending: **Qwen3-235B/30B**
 (qwen3moe, softmax router). Reference box: RTX 5060 Ti 16GB + RTX
 4060 Ti 16GB, Ryzen 9900X, 30GB RAM, one Gen5 NVMe.
 
-| decode | pulsar | reference engine (same box) |
-|---|---|---|
-| Kimi K2.7-Code 1T (339GB, 8-shard split gguf) | **1.3 tok/s** | – |
-| TML Inkling 1T (317GB, 8-shard split gguf) | **1.5 tok/s** | – |
-| Hy3 295B (85GB gguf) | **7.2 tok/s** | 0.64–0.70 (ds4) |
-| Gemma 4 26B-A4B (17GB gguf) | **36 tok/s** | – |
-| GLM-5.2 743B (197GB gguf) | **2.0 tok/s** | 0.40 (ds4) |
-| Hy3 long-prompt prefill | **28 tok/s** (tensor cores, 1.8×) | 0.44 (ds4) |
-| GLM-5.2 long-prompt prefill | **15 tok/s** (tensor cores, 2.7×) | – |
-| warm start | hot experts bulk-load in **~3s** | – |
+| Model | Total | Active / token | gguf | Decode, warm | vs ds4, same box |
+|---|---|---|---|---|---|
+| Gemma 4 26B-A4B* | 26B | 4B | 16GB (Q4_K_XL) | **33 tok/s** | – |
+| Hy3 295B | 295B | 21B (top-8 of 192) | 79GB (IQ2_XXS) | **7.2 tok/s** | 0.64–0.70 |
+| MiniMax M3* | 428B | 23B | 134GB (Q2_K_XL) | **2.9 tok/s** | – |
+| GLM-5.2 | 744B | 40B | 197GB (Q2_K_XL) | **2.0 tok/s** | 0.40 |
+| TML Inkling | 975B | 41B (6 + 2 shared) | 296GB (Q2_K_XL) | **1.5 tok/s** | – |
+| Kimi K2.7 Code | ~1T | 32B | 339GB (Q2_K_XL) | **1.3 tok/s** | – |
+
+\* Sustained warm decode at n=64. Both read higher on shorter generations
+(M3 does 5.4 tok/s at n=12) because the per-token SSD miss rate climbs
+toward steady state as decoding fans across more experts. Gemma is small
+enough to sit around 84% resident in VRAM, so it is bound by pulsar's
+per-token streaming overhead rather than disk, and a fully-resident engine
+would decode a model that size faster. Pulsar's streaming path is built for
+models larger than memory, not small resident ones.
+
+Prefill runs the quantized weights through int8 tensor cores: Hy3
+**28 tok/s** (1.8× over dp4a, ds4 0.44), GLM-5.2 **15 tok/s** (2.7×).
+Warm start: hot experts bulk-load in **~3s**. (ds4 = NeutronStar, the
+llama.cpp-fork predecessor, on the same box.)
 
 Decode figures are **warm-run** (second run onward). The first run is
 cold while the expert-popularity census fills; only after it is written
 do the host cache and resident tiers load hot, so a cold run reads far
-more from disk and clocks lower — don't benchmark the first run. On the
-reference box Gemma 4 goes 12.7 tok/s cold → 36 tok/s warm (hot experts
+more from disk and clocks lower, so don't benchmark the first run. On the
+reference box Gemma 4 goes 12.7 tok/s cold → 33 tok/s warm (hot experts
 resident on the second GPU). See the warm-start note under Quick start.
 
 Prefill runs the quantized weights through int8 tensor cores on
