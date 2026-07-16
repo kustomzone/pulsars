@@ -75,7 +75,11 @@ bit-identical to the dp4a path.
 
 GLM runs contexts past its naive 2048-row ceiling via a port of the
 DSA lightning indexer (top-k row selection per token), validated
-against the reference engine with a long-context retrieval probe.
+against the reference engine with a long-context retrieval probe. The
+indexer's batch scorer runs on tensor cores (f16 keys, m16n8k16 with the
+relu-weight epilogue fused between heads): 1.9x long-prompt prefill at
+4k context, byte-identical ids vs the scalar path, and the index K cache
+halves to f16 (the reference indexer ships FP8 in production).
 
 On a single RTX 4060 Ti (where NeutronStar set its numbers): Hy3 2.6,
 GLM 0.56.
