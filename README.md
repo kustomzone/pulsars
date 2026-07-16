@@ -13,11 +13,11 @@ a neutron star that spins fast and emits beams.
 
 ## What it does today
 
-Seven model architectures on consumer GPUs — running: **Hy3 295B**
+Seven model architectures on consumer GPUs, running: **Hy3 295B**
 (hy-v3, GQA), **GLM-5.2 743B** (glm-dsa, MLA + DSA sparse attention),
 **Kimi K2.7 1T** (deepseek2, MLA + YaRN), **MiniMax M3** (partial
 rotary, swiglu_oai), **Gemma 4 26B-A4B** (interleaved sliding-window
-attention, dual GELU FFN), and **TML Inkling 1T** (no rope — learned
+attention, dual GELU FFN), and **TML Inkling 1T** (no rope, learned
 relative-position bias, shortconv streams, sink router; supported the
 day after release); code-complete, first run pending: **Qwen3-235B/30B**
 (qwen3moe, softmax router). Reference box: RTX 5060 Ti 16GB + RTX
@@ -55,7 +55,7 @@ resident on the second GPU). See the warm-start note under Quick start.
 Prefill runs the quantized weights through int8 tensor cores on
 sm_80+ (`mma.m16n8k32` dense GEMM + mmq-style grouped MoE that unpacks
 each expert superblock to shared memory once per prefill chunk and
-rescales per quant block in registers) — 1.8–2.7× over the dp4a
+rescales per quant block in registers), 1.8–2.7× over the dp4a
 kernels, which remain the path on older GPUs. Decode is single-token
 and memory-bound, so it is deliberately untouched: ids stay
 bit-identical to the dp4a path.
@@ -69,23 +69,23 @@ GLM 0.56.
 
 **Zero-config multi-GPU.** At startup pulsar *measures* each card's H2D
 bandwidth (labels lie: an x8-labeled slot can train x1, a driver bug can
-park a Gen5 card at Gen1 — only a measurement sees that) and assigns
+park a Gen5 card at Gen1, only a measurement sees that) and assigns
 roles by what each card is actually good at:
 
 - **Expert streaming** needs link bandwidth → the fastest measured card.
 - **Attention residency** (MLA models: the whole ~14GB attn stack + KV
-  parked on a second card) only needs capacity — weights cross the bus
+  parked on a second card) only needs capacity, weights cross the bus
   once at load, then only activations hop (2× 24KB per layer). A
   bandwidth-crippled card serves attention at full speed.
 - **Expert tiers**: leftover cards are filled with the hottest expert
   triples from the warm census, and the MoE kernels *run on the card
-  that holds the weights* — partial outputs gather back over PCIe. On
+  that holds the weights*, partial outputs gather back over PCIe. On
   the reference box the tier serves ~90% of expert computations and
   nearly doubles Hy3 decode.
 
 Correctness is certified against ds4, not assumed: teacher-forced along
 ds4's greedy path (15/16 per-position argmax agreement on Hy3, 10/12 on
-GLM — every miss at a <0.09-logit tie), byte-identical greedy ids across
+GLM, every miss at a <0.09-logit tie), byte-identical greedy ids across
 single-GPU vs attn-offload configurations, and bit-exact decode
 determinism on a fixed code path (`--decode-consistency`, below).
 
@@ -93,14 +93,14 @@ determinism on a fixed code path (`--decode-consistency`, below).
 
 - Linux (io_uring and CUDA are load-bearing; the workspace *compiles* on
   macOS but the engine is stubbed out there)
-- One or more NVIDIA GPUs, GTX 10-series (Pascal, sm_61) or newer — the
+- One or more NVIDIA GPUs, GTX 10-series (Pascal, sm_61) or newer, the
   default build ships native code for 10/16/20, 30, and 40-series plus
   PTX that JITs on everything else (50-series Blackwell, Volta, Hopper).
   `PULSAR_CUDA_ARCH` overrides codegen targets
 - CUDA toolkit with `nvcc` on PATH, plus a host compiler nvcc accepts
   (gcc-12 works; newer gcc may need `CXX=g++-12` at build time)
 - Rust via [rustup](https://rustup.rs)
-- The model gguf on a fast NVMe — streaming reads it at up to ~7GB/s,
+- The model gguf on a fast NVMe, streaming reads it at up to ~7GB/s,
   so the disk *is* the decode speed
 - ~16GB system RAM for the host-side expert cache (more helps; the cache
   budget is the single biggest knob after the disk)
@@ -109,7 +109,7 @@ determinism on a fixed code path (`--decode-consistency`, below).
 
 Pulsar reads standard llama.cpp ggufs: ten routed-expert quant
 formats (q2_K, q3_K, q4_0, q4_K, q5_K, q5_1, q6_K, iq2_xxs, iq2_xs,
-iq3_xxs — including fused gate_up tensors and non-256-multiple expert
+iq3_xxs, including fused gate_up tensors and non-256-multiple expert
 widths), K-quant dense tensors (requantized to q8_0 at load), tied
 embeddings, split -00001-of-000NN shard sets (point `-m` at the first
 shard), and both converter dialects (ds4-lineage and upstream).
@@ -159,7 +159,7 @@ curl http://127.0.0.1:11435/v1/chat/completions -d '{
 First run is cold. On exit the engine writes a `<model>.gguf.warm`
 sidecar (a popularity census of expert slabs); every later run bulk-loads
 the hot set in a few seconds, and expert tiers (spare GPUs) fill from the
-same census — so the second run is the fast one.
+same census, so the second run is the fast one.
 
 ### CLI flags
 
@@ -209,14 +209,14 @@ CXX=g++-12 cargo test -p kernels --release -- --ignored   # GPU kernel selftests
 Per MoE layer, per token (or per prefill chunk as a union across the
 whole batch), an expert slab resolves through:
 
-1. **Resident tier** (spare GPUs) — the hottest expert triples live
+1. **Resident tier** (spare GPUs): the hottest expert triples live
    permanently on leftover cards; their MoE compute happens *there* and
    only activations cross PCIe. Placement, not cache: no eviction.
-2. **VRAM hot-set cache** (primary GPU) — a fixed pool with touch-count
+2. **VRAM hot-set cache** (primary GPU): a fixed pool with touch-count
    admission: a slab earns a slot only by being hotter than the coldest
    resident, so the pool holds a *stable* hot set instead of thrashing.
-3. **Host LFU cache** — RAM-budgeted, persisted to the `.warm` sidecar.
-4. **io_uring + O_DIRECT** — misses are fetched at queue depth 32, and
+3. **Host LFU cache**: RAM-budgeted, persisted to the `.warm` sidecar.
+4. **io_uring + O_DIRECT**: misses are fetched at queue depth 32, and
    each completion is uploaded to the GPU while the remaining reads are
    still in flight.
 
@@ -226,7 +226,7 @@ input.
 
 The MoE kernels never consult global state: every launch receives
 explicit per-(token, slot) device pointers for gate/up/down, and a NULL
-slot means "not mine" — which is what makes per-card partial execution
+slot means "not mine", which is what makes per-card partial execution
 native. Where the bytes came from is the host's problem, resolved before
 launch.
 
@@ -237,12 +237,12 @@ launch.
   noise.
 - Batched prefill and single-token decode use different reduction
   orders, so greedy near-ties (top1−top2 < ~0.5 logits) can flip between
-  them — the same class of drift ds4 has between its CUDA and Metal
+  them, the same class of drift ds4 has between its CUDA and Metal
   backends. `--decode-consistency N` measures it; with `PULSAR_BATCH=1`
   the two paths are identical and the comparison is bit-exact (verified:
   max |Δlogit| = 0.0).
 - Expert tiers split the per-slot sum across cards, which reorders float
-  adds — same drift class. `PULSAR_TIERS=off` restores the single-device
+  adds, same drift class. `PULSAR_TIERS=off` restores the single-device
   exact path. Attention offload does NOT drift: ids are byte-identical
   with and without it.
 
@@ -269,7 +269,7 @@ grouped MoE) · MiniMax M3, Qwen3, Gemma 4 forward graphs.
 Not yet:
 
 - tensor-core unpackers for the remaining expert formats (iq2_xs,
-  iq3_xxs, q4_K, q5_1, q2_K, q3_K — the harness takes one ~40-line
+  iq3_xxs, q4_K, q5_1, q2_K, q3_K, the harness takes one ~40-line
   unpacker per format)
 - own BF16→quant quantizer (removes the last llama.cpp dependency from
   the model-prep pipeline)
