@@ -182,5 +182,57 @@ still TODO). prefill has a batch path + compressor_finish_prefill_state.
   how raw window + compressed rows compose per query - the ONE remaining
   unread region (prefill batch path included)
 
-## Status: recon 100% (minus row-assembly detail flagged above),
-## implementation 0%. Next session: execute this map top to bottom.
+## Status: recon 100%, implementation WRITTEN (commit 3d7c4ed) -
+## NOT yet compiled/run (substrate ssh blocked on tailscale re-auth).
+
+### Session-3: remaining recon answers (all former unknowns closed)
+- DS4_N_HASH_LAYER = 3 (`deepseek4.hash_layer_count`)
+- compress ratios: `deepseek4.attention.compress_ratios` u32 array;
+  Flash = layers 0,1 raw-only, then even il = 4, odd il = 128.
+  ratio-4 layers carry compressor (width 1024) + indexer (width 256);
+  ratio-128 layers compressor only (width 512); coff = ratio==4 ? 2 : 1
+- clamp: `deepseek4.swiglu_clamp_exp` f32 array, constant 10.0
+- output_hc merge: rms_norm_no_weight(flat 16384) -> output_hc_fn
+  [16384->4] -> w[i] = sigmoid(pre*scale[0]+base[i]) + hc_eps ->
+  weighted stream sum -> output_norm -> q8_0 head
+- attention row assembly (decode): raw SWA ring (cap n_swa=128, f16
+  rows, fp8-sim'd nope part) + ALL compressed rows (ratio-4 masked by
+  indexer top-512 over the indexer comp cache); ratio-0 layers attend
+  over the raw ring only. Sink logit per head joins max+denominator.
+  Q gets a PER-HEAD WEIGHTLESS RMS NORM after q_b; heads get an
+  INVERSE rope tail before the grouped output projection.
+- rope: dense layers base 10000 plain; compressed layers base 160000
+  YaRN 1/16 with attn_factor = 1/(1+0.1 ln 16) cancelling the helper's
+  internal mscale. Adjacent-pair rotation on the LAST 64 of 512.
+- fp8 sim: 64-wide blocks over the 448 nope dims, pow2 scale
+  ceil(log2(amax/448)), e4m3fn nearest-even, clamp +-448. Raw AND comp
+  rows also f16-round on push. Indexer rows: hadamard128 (orthonormal)
+  + e2m1 {0,.5,1,1.5,2,3,4,6} 32-block pow2 QAT.
+- DS4_NEG_INF = -1e30 (finite; the pool's empty-check needs it)
+- chat template: bos + bare system text; <U+FF5C>User<U+FF5C>text;
+  <U+FF5C>Assistant<U+FF5C> + </think> opener (ids 128803/128804,
+  think 128821/128822); assistant history closes with eos
+
+### Implementation shape (commit 3d7c4ed)
+- Family::Dsv4; Attn::Dsv4(Box<Dsv4W>); Ffn::Moe reused (gate_inp
+  converted f16->f32); LayerW.attn_output = attn_output_b
+- engine/src/real/dsv4.rs: forward_dsv4 (single-token loop; rows<=1),
+  host Sinkhorn/router/compressor/indexer in reference f32; lean
+  expert resolve (dev cache + host LFU + io_uring; NO tiers/prefetch/
+  grouped/MTP yet); kcache = raw ring, vcache = comp rows,
+  indexer comp cache host-only
+- CUDA dsv4_kernels.inc: pulsar_dsv4_hc_mix / _attention / _fp8_sim /
+  _f16_round + selftest; act_op 3 in pulsar_glu; mla rope tail gained
+  sin_sign + pulsar_dsv4_rope_tail(inverse)
+- f16 weights: compressor/indexer q_b requantized to q8_0; router/HC
+  fns/proj converted to f32; token_embd f16 -> q8_0 pinned
+
+### Next (on substrate)
+1. cargo build + cargo test -p kernels (dsv4_selftest) + engine host
+   tests; fix compile fallout
+2. load-test vs the real gguf (validates all 41 tensor bindings)
+3. first decode: -p "Question: what is 2+2? Answer:" greedy, coherence
+4. scripts/check.sh (existing archs must stay bit-exact) + bench.sh
+5. ceilings noted: no tiers/prefetch/batched prefill; prefill is
+   decode-speed; ~86 host syncs/token (hc mix + router readbacks);
+   attn budget default 8GB resident

@@ -90,6 +90,10 @@ enum ChatStyle {
     /// picks <|content_thinking|>/<|content_text|> itself and stops at
     /// <|content_model_end_sampling|>)
     Inkling,
+    /// bos + system-text + U+FF5C-fenced markers: user-marker text
+    /// assistant-marker </think> ... (DeepSeek V3/V4 lineage; ds4's
+    /// ds4_chat_append_message with thinking off)
+    Deepseek,
 }
 
 pub struct ChatMarkers {
@@ -171,6 +175,22 @@ impl ChatMarkers {
                 stops: t.stop_ids.clone(),
             });
         }
+        if t.find_token("<｜User｜>").is_some() {
+            // DeepSeek V3/V4: system text is bare after bos; <think> /
+            // </think> ride as aux markers (assistant opener closes the
+            // think block - thinking stays off, ds4's default here)
+            return Ok(ChatMarkers {
+                style: ChatStyle::Deepseek,
+                bos: Some(t.bos_id.ok_or(Error::MissingKey("bos_token_id"))?),
+                eos: t.eos_id.ok_or(Error::MissingKey("eos_token_id"))?,
+                eot: None,
+                user: find("<｜User｜>")?,
+                assistant: find("<｜Assistant｜>")?,
+                aux0: find("<think>")?,
+                aux1: find("</think>")?,
+                stops: t.stop_ids.clone(),
+            });
+        }
         if t.find_token("<|im_start|>").is_some() {
             // Qwen ChatML: <|im_start|> opens every turn, <|im_end|> closes
             return Ok(ChatMarkers {
@@ -201,7 +221,7 @@ impl ChatMarkers {
     /// System text ids for the first turn (Hy3: bare text after bos).
     pub fn render_system(&self, t: &Tokenizer, text: &str) -> Vec<u32> {
         match self.style {
-            ChatStyle::Hy3 => t.encode(text),
+            ChatStyle::Hy3 | ChatStyle::Deepseek => t.encode(text),
             ChatStyle::ChatMl => {
                 let mut v = vec![self.user];
                 v.extend(t.encode(&format!("system\n{text}")));
@@ -247,7 +267,7 @@ impl ChatMarkers {
     /// A user message (no assistant opener).
     pub fn render_user(&self, t: &Tokenizer, text: &str) -> Vec<u32> {
         match self.style {
-            ChatStyle::Hy3 => {
+            ChatStyle::Hy3 | ChatStyle::Deepseek => {
                 let mut v = vec![self.user];
                 v.extend(t.encode(text));
                 v
@@ -287,6 +307,8 @@ impl ChatMarkers {
     pub fn open_assistant(&self, t: &Tokenizer) -> Vec<u32> {
         match self.style {
             ChatStyle::Hy3 => vec![self.assistant, self.aux0, self.aux1],
+            // <U+FF5C>Assistant<U+FF5C> then </think>: thinking off
+            ChatStyle::Deepseek => vec![self.assistant, self.aux1],
             ChatStyle::Kimi => {
                 let mut v = vec![self.assistant];
                 v.extend(t.encode("assistant"));
