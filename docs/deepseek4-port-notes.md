@@ -132,3 +132,55 @@ still TODO). prefill has a batch path + compressor_finish_prefill_state.
   rope split 64 of 512, fp8 cache quant call sites)
 - chat-v2 template markers; clamp metadata key for expert act
 - output_hc merge exact form
+
+## Session-2 final: router decoded - RECON COMPLETE
+
+### Router (layer_router_probs_one ~7327, topk ~7370)
+- probs[i] = sqrt(softplus(logit_i)), logits = ffn_gate_inp . x (f16)
+- SELECTION: probs + exp_probs_b bias, top-6 (biased select, like V3
+  noaux); hash layers replace selection with tid2eid[token]
+- WEIGHTS: unbiased probs[selected], normalized by their sum (floor
+  6.1035e-5), x expert_weights_scale (1.5)
+- pulsar mapping: new softmax_mode in router_select (sqrt-softplus +
+  sum-norm); bias input already exists. Hash layers: engine-side selected
+  override + weights via the same probs kernel.
+
+## Integration map (pulsar anchors, engine/src/lib.rs @ dc2928b)
+
+- Family enum (line ~32): add Dsv4 variant; arch parse at ~166
+  (Some("deepseek4") => Family::Dsv4)
+- Shape: add n_hc(4), hc_sinkhorn(20), compress_ratio (READ KEY from
+  metadata - grep model_get near ds4.c:2019 for the exact name),
+  n_swa (attention.sliding_window), out_groups(8)/out_rank(1024),
+  clamp limit key; reuse n_idx_head/n_idx_dim/indexer_top_k, n_lora_q,
+  yarn fields
+- LayerW (~455): add `dsv4: Option<Dsv4W>` beside ink/gemma. Dsv4W =
+  { q_a, q_a_norm, q_b, kv, kv_a_norm, out_a, out_b, sinks,
+    comp_{ape,kv,gate,norm}, idx_q_b, idx_proj, idx_comp_{ape,kv,gate,norm},
+    hc_attn_{fn,scale,base}, hc_ffn_{fn,scale,base}, tid2eid (host Vec<i32>
+    or device), exp_probs_b via Ffn::Moe.probs_b }
+  output_hc_{fn,scale,base} on Model.
+- Loader anchor ~1516 (`let t = |suffix|`): all 41 names in the schema
+  section above; tid2eid is I32 [6][129280] - load host-side (768KB per
+  layer x first-N layers; check DS4_N_HASH_LAYER value in ds4.c)
+- Forward: HC streams state = 4x4096 per token (State buffers x4);
+  embed -> hc_from_plain_embedding; per layer: hc_pre(attn) -> attn block
+  -> hc_post -> hc_pre(ffn) -> moe -> hc_post; final output_hc merge ->
+  output_norm -> lm head
+- KV cache: single 512-wide latent per position, fp8 e4m3 ALWAYS (rope
+  64 within row; reuse gqa fp8 helpers); compressed rows via compressor
+  state machine (state [2R x width] per layer device-side); indexer cache
+  128-wide with hadamard128+e2m1 QAT rows
+- CUDA new: hc_mix kernel (rms16384 + matvec24 f16 + sinkhorn + weighted
+  sum - can be ONE kernel, all tiny), sinks in attention softmax (extend
+  gqa/new kernel over latent rows), compressor pool kernel, hadamard128 +
+  e2m1 device fns, act_op 3 clamped-silu in pulsar_glu, router mode
+  sqrt-softplus
+- Chat template: ds4_chat_append_message ~22410 (read when wiring --chat;
+  one-shot works with the dynamic stop set already)
+- Attention row assembly (decode): READ ds4.c ~8563-8663 + callers for
+  how raw window + compressed rows compose per query - the ONE remaining
+  unread region (prefill batch path included)
+
+## Status: recon 100% (minus row-assembly detail flagged above),
+## implementation 0%. Next session: execute this map top to bottom.
