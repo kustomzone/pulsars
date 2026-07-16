@@ -231,7 +231,8 @@ RAM (host cache 12→22) and primary VRAM (dev cache →8).
 
 ```sh
 cargo test                                        # host-side (any OS)
-CXX=g++-12 cargo test -p kernels --release -- --ignored   # GPU kernel selftests vs CPU references
+CXX=g++-12 cargo test -p kernels --release -- --test-threads=1   # GPU kernel selftests vs CPU references
+scripts/check.sh /path/to/model.gguf              # full commit gate (build + selftests + bit-exact decode)
 ```
 
 ## How the streaming works
@@ -288,21 +289,33 @@ GPUs · temp/top-p/min-p sampling · interactive chat · OpenAI-compatible
 server (`pulsar-serve`: `/v1/models`, `/v1/chat/completions` with SSE
 streaming; local single-user, one request at a time).
 
-Done since: DSA lightning indexer (GLM contexts past 2048) · Kimi
-K2.7/deepseek2 with llama.cpp-exact YaRN · split-gguf loading · MTP +
-draft-free n-gram speculation (built, measured honestly: net-slower
-until the host cache outruns the disk; `PULSAR_MTP=1` /
-`PULSAR_NGRAM=n` to experiment) · style-aware chat templates
-(Hy3/Kimi/ChatML/Gemma) · int8 tensor-core prefill (dense GEMM +
-grouped MoE) · MiniMax M3, Qwen3, Gemma 4 forward graphs.
+Done since: DSA lightning indexer (GLM contexts past 2048, batch scorer
+on tensor cores) · Kimi K2.7/deepseek2 with llama.cpp-exact YaRN ·
+split-gguf loading · MTP + draft-free n-gram speculation (built,
+measured honestly: net-slower until the host cache outruns the disk;
+`PULSAR_MTP=1` / `PULSAR_NGRAM=n` to experiment) · style-aware chat
+templates (Hy3/Kimi/ChatML/Gemma/MiniMax/Inkling/DeepSeek) · int8
+tensor-core prefill (dense GEMM + grouped MoE) · MiniMax M3, Qwen3,
+Gemma 4, TML Inkling forward graphs · opt-in fp8 e4m3 KV cache
+(`PULSAR_KV=fp8`) · `pulsar-quant` recipe quantizer (BF16 gguf →
+ds4-style expert mixes, iq2_xxs with imatrix, per-tensor `--map`
+rules; removes llama.cpp from the model-prep pipeline) ·
+DeepSeek-V4-Flash (deepseek4): hyper-connection residual streams,
+streaming compressed KV + sink attention, indexer QAT top-k, token-id
+hash routing.
 
 Not yet:
 
+- deepseek4 perf pass: batched prefill (prompts currently process
+  sequentially), resident tiers + cross-layer prefetch for the dsv4
+  resolve, fewer host syncs on the hyper-connection gates
 - tensor-core unpackers for the remaining expert formats (iq2_xs,
   iq3_xxs, q4_K, q5_1, q2_K, q3_K, the harness takes one ~40-line
   unpacker per format)
-- own BF16→quant quantizer (removes the last llama.cpp dependency from
-  the model-prep pipeline)
+- shard-streaming quantize in `pulsar-quant` (fetch → quantize → delete,
+  for BF16 sources bigger than the disk)
+- Qwen3.6 hybrid (Gated DeltaNet + gated attention): the 35B-A3B would
+  put a strong model on 1660-class GPUs
 
 ## License
 
