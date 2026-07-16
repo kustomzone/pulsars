@@ -2141,8 +2141,17 @@ mod real {
                 .iter()
                 .chain(m.mtp.iter().map(|mt| &mt.layer))
                 .filter_map(|l| match &l.ffn {
-                    Ffn::Moe { gate_exps, up_exps, down_exps, .. } => {
-                        Some(gate_exps.expert_bytes.max(up_exps.expert_bytes).max(down_exps.expert_bytes))
+                    Ffn::Moe { gate_exps, up_exps, down_exps, sink, .. } => {
+                        Some(
+                            gate_exps
+                                .expert_bytes
+                                .max(up_exps.expert_bytes)
+                                .max(down_exps.expert_bytes)
+                                // sink bank slabs cache like any other
+                                .max(sink.as_ref().map_or(0, |sk| {
+                                    sk.iter().map(|t| t.expert_bytes).max().unwrap_or(0)
+                                })),
+                        )
                     }
                     _ => None,
                 })
@@ -3040,17 +3049,20 @@ mod real {
                                 None => wants.push(*r),
                             }
                         }
-                        let slab = gate_exps
-                            .expert_bytes
-                            .max(up_exps.expert_bytes)
-                            .max(down_exps.expert_bytes)
-                            .max(sink.as_ref().map_or(0, |sk| {
-                                sk.iter().map(|t| t.expert_bytes).max().unwrap_or(0)
-                            })) as usize;
-                        if wants.len() * slab > st.staging.bytes() {
-                            st.staging = DeviceBuf::alloc(wants.len() * slab + SLAB_SLACK)?;
+                        // staging packs each want at its OWN size (sizes
+                        // differ per tensor - inkling's sink bank slabs are
+                        // several times the iq2 routed ones, and a uniform
+                        // max stride blew the buffer up 5x). Completion
+                        // order is arbitrary, so bases are precomputed.
+                        let mut stage_base = std::collections::HashMap::new();
+                        let mut stage_total = 0usize;
+                        for r in &wants {
+                            stage_base.insert(r.offset, stage_total);
+                            stage_total += r.len as usize;
                         }
-                        let mut staged = 0usize;
+                        if stage_total + SLAB_SLACK > st.staging.bytes() {
+                            st.staging = DeviceBuf::alloc(stage_total + SLAB_SLACK)?;
+                        }
                         let unified = st.unified;
                         let dev_cache = &mut st.dev_cache;
                         let staging = &mut st.staging;
@@ -3067,8 +3079,7 @@ mod real {
                             let p = match dev_cache.maybe_insert(off, payload, &in_use)? {
                                 Some(p) => p,
                                 None => {
-                                    let base = staged * slab;
-                                    staged += 1;
+                                    let base = stage_base[&off];
                                     staging.write(base, payload)?;
                                     staging.ptr_at(base)
                                 }

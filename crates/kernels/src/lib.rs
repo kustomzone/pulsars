@@ -332,7 +332,14 @@ mod real {
         pub fn alloc(bytes: usize) -> Result<Self> {
             ensure_device();
             let mut ptr = std::ptr::null_mut();
-            check_rt(unsafe { cudaMalloc(&mut ptr, bytes.max(1)) }, "cudaMalloc")?;
+            if let Err(e) = check_rt(unsafe { cudaMalloc(&mut ptr, bytes.max(1)) }, "cudaMalloc") {
+                eprintln!(
+                    "pulsar: cudaMalloc({:.2} GB) failed on device {}",
+                    bytes as f64 / 1e9,
+                    get_device()
+                );
+                return Err(e);
+            }
             Ok(DeviceBuf { ptr, host: std::ptr::null_mut(), bytes, dev: get_device() })
         }
 
