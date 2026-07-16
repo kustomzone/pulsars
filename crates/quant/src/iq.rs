@@ -409,7 +409,7 @@ pub fn quantize_row_iq2_xxs(x: &[f32], qw: &[f32], out: &mut Vec<u8>) {
 pub fn read_imatrix(path: &std::path::Path) -> Result<std::collections::HashMap<String, Vec<f32>>, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut at = 0usize;
-    let mut i32_at = |at: &mut usize| -> Result<i32, String> {
+    let i32_at = |at: &mut usize| -> Result<i32, String> {
         let v = i32::from_le_bytes(
             bytes.get(*at..*at + 4).ok_or("imatrix truncated")?.try_into().unwrap(),
         );
