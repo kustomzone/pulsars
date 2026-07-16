@@ -176,10 +176,10 @@ Everything auto-configures; these override.
 | `PULSAR_GPU` | measured | CUDA index of the expert-streaming (primary) GPU |
 | `PULSAR_ATTN_GPU` | auto | CUDA index of the attention GPU (MLA models); `off` disables offload |
 | `PULSAR_TIERS` | on | `off` disables resident expert tiers (also the bit-exact single-device path) |
-| `PULSAR_CACHE_GB` | 12 / 22¹ | host RAM budget for the expert LFU cache |
-| `PULSAR_DEV_CACHE_GB` | 3 / 1 / 8¹ | VRAM budget for the hot-expert pool on the primary |
+| `PULSAR_CACHE_GB` | measured | host RAM budget for the expert LFU cache (solved from MemAvailable) |
+| `PULSAR_DEV_CACHE_GB` | solved | VRAM hot-expert pool: measured free VRAM minus staging + reserve |
 | `PULSAR_ATTN_VRAM_GB` | all that fits | attn VRAM budget (single-GPU MLA: default 6) |
-| `PULSAR_BATCH` | 256 | prefill chunk size (bigger = fewer corpus passes = faster prefill, more VRAM) |
+| `PULSAR_BATCH` | solved | prefill chunk: largest whose worst-case expert staging fits a third of free VRAM |
 | `PULSAR_NO_PREFETCH` | unset | set to disable the cross-layer prefetcher |
 | `PULSAR_PROFILE` | unset | print per-stage wall-time profile |
 
