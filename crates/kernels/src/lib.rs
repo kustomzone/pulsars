@@ -115,6 +115,12 @@ mod real {
         fn pulsar_dsv4_fp8_sim(x: *mut c_void, n_rows: u32, head_dim: u32, n_rot: u32) -> i32;
         fn pulsar_dsv4_f16_round(x: *mut c_void, n: u32) -> i32;
         fn pulsar_dsv4_selftest() -> i32;
+        fn pulsar_qwen35_conv_step(out: *mut c_void, x: *const c_void, kern: *const c_void, state: *mut c_void, n_chan: u32, k: u32) -> i32;
+        fn pulsar_qwen35_l2_norm(x: *mut c_void, rows: u32, dim: u32, eps: f32) -> i32;
+        fn pulsar_qwen35_gdn_step(out: *mut c_void, state: *mut c_void, q: *const c_void, k: *const c_void, v: *const c_void, g: *const c_void, beta: *const c_void, h_v: u32, h_k: u32, dim: u32) -> i32;
+        fn pulsar_qwen35_split_gate(q: *mut c_void, gate: *mut c_void, fused: *const c_void, n_head: u32, dim: u32) -> i32;
+        fn pulsar_qwen35_sigmoid_gate(x: *mut c_void, gate: *const c_void, n: u32) -> i32;
+        fn pulsar_qwen35_selftest() -> i32;
         fn pulsar_mla_kv_lora_rms_norm(out: *mut c_void, kv_raw: *const c_void, w: *const c_void, n_tok: u32, kv_raw_dim: u32, kv_lora_dim: u32, eps: f32) -> i32;
         fn pulsar_mla_store_compact_kv(kv_lora_cache: *mut c_void, k_rope_cache: *mut c_void, kv_norm: *const c_void, kv_raw: *const c_void, pos0: u32, n_tok: u32, cache_cap: u32, kv_raw_dim: u32, kv_lora_dim: u32, qk_rope: u32) -> i32;
         fn pulsar_mla_fill_selected_range(selected: *mut c_void, n_tok: u32, pos0: u32, n_selected: u32, pad_row: u32) -> i32;
@@ -929,6 +935,40 @@ mod real {
 
     pub fn dsv4_selftest() -> bool {
         unsafe { pulsar_dsv4_selftest() != 0 }
+    }
+
+    /// qwen35 GDN: depthwise conv (K taps) + silu over one token's qkv
+    /// row; state [K-1][n_chan] rolls forward in place.
+    pub fn qwen35_conv_step(out: &mut DeviceBuf, x: &DeviceBuf, kern: &DeviceBuf, state: &mut DeviceBuf, n_chan: u32, k: u32) -> Result {
+        check(unsafe { pulsar_qwen35_conv_step(out.ptr_mut(), x.ptr(), kern.ptr(), state.ptr_mut(), n_chan, k) }, "qwen35_conv_step")
+    }
+
+    /// L2-normalize rows in place (ggml_l2_norm: x / sqrt(sum x^2 + eps)).
+    pub fn qwen35_l2_norm(x: &mut DeviceBuf, rows: u32, dim: u32, eps: f32) -> Result {
+        check(unsafe { pulsar_qwen35_l2_norm(x.ptr_mut(), rows, dim, eps) }, "qwen35_l2_norm")
+    }
+
+    /// Gated DeltaNet autoregressive step (one token, all heads):
+    /// decay + delta-rule rank-1 state update + output, in place on
+    /// state [h_v][dim][dim]. q/k are h_k-headed (repeat h_v/h_k).
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_gdn_step(out: &mut DeviceBuf, state: &mut DeviceBuf, q: &DeviceBuf, k: &DeviceBuf, v: &DeviceBuf, g: &DeviceBuf, beta: &DeviceBuf, h_v: u32, h_k: u32, dim: u32) -> Result {
+        check(unsafe { pulsar_qwen35_gdn_step(out.ptr_mut(), state.ptr_mut(), q.ptr(), k.ptr(), v.ptr(), g.ptr(), beta.ptr(), h_v, h_k, dim) }, "qwen35_gdn_step")
+    }
+
+    /// Split the fused per-head [q dim | gate dim] projection into
+    /// contiguous q and gate buffers.
+    pub fn qwen35_split_gate(q: &mut DeviceBuf, gate: &mut DeviceBuf, fused: &DeviceBuf, n_head: u32, dim: u32) -> Result {
+        check(unsafe { pulsar_qwen35_split_gate(q.ptr_mut(), gate.ptr_mut(), fused.ptr(), n_head, dim) }, "qwen35_split_gate")
+    }
+
+    /// x *= sigmoid(gate) elementwise.
+    pub fn qwen35_sigmoid_gate(x: &mut DeviceBuf, gate: &DeviceBuf, n: u32) -> Result {
+        check(unsafe { pulsar_qwen35_sigmoid_gate(x.ptr_mut(), gate.ptr(), n) }, "qwen35_sigmoid_gate")
+    }
+
+    pub fn qwen35_selftest() -> bool {
+        unsafe { pulsar_qwen35_selftest() != 0 }
     }
 
     pub fn mla_kv_lora_rms_norm(out: &mut DeviceBuf, kv_raw: &DeviceBuf, w: &DeviceBuf, n_tok: u32, kv_raw_dim: u32, kv_lora_dim: u32, eps: f32) -> Result {

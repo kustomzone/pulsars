@@ -4337,3 +4337,4 @@ extern "C" int pulsar_mla_selftest(void) {
 }
 #include "dsa_indexer.inc"
 #include "dsv4_kernels.inc"
+#include "qwen35_kernels.inc"
