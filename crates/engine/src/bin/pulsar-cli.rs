@@ -157,6 +157,11 @@ fn run() -> engine::Result {
         match a.as_str() {
             "-m" => model_path = Some(need("-m")?),
             "-p" => prompt = Some(need("-p")?),
+            // long prompts exceed the OS single-arg limit (~128KB on Linux)
+            "-f" | "--prompt-file" => {
+                let path = need("--prompt-file")?;
+                prompt = Some(std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?);
+            }
             "--tokens" => tokens_arg = Some(need("--tokens")?),
             "-n" => n_predict = need("-n")?.parse()?,
             "--ctx" => ctx = need("--ctx")?.parse()?,
