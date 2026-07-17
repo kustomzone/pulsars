@@ -176,10 +176,13 @@ mod avx2 {
             let mut is = 0;
             for k in 0..2 {
                 let q2v = _mm256_loadu_si256(blk.add(16 + 32 * k) as *const __m256i);
-                for shift in 0..4 {
-                    let q = _mm256_and_si256(_mm256_srli_epi16(q2v, 2 * shift), low2);
+                for shift in 0..4i32 {
+                    let q = _mm256_and_si256(
+                        _mm256_srl_epi16(q2v, _mm_cvtsi32_si128(2 * shift)),
+                        low2,
+                    );
                     let q8v =
-                        _mm256_loadu_si256(q8.add(128 * k + 32 * shift) as *const __m256i);
+                        _mm256_loadu_si256(q8.add(128 * k + 32 * shift as usize) as *const __m256i);
                     let d16 = _mm256_maddubs_epi16(q, q8v);
                     let scv = _mm256_set_m128i(
                         _mm_set1_epi16((sc[is + 1] & 0x0f) as i16),
