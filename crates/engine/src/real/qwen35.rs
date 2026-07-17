@@ -433,6 +433,25 @@ impl Model {
         let value_dim = s.ssm_v_heads * s.ssm_state;
         let conv_dim = 2 * key_dim + value_dim;
 
+        // ---- DFlash feature capture: HF hidden_states[il] convention -
+        // the residual stream ENTERING layer il (= output of layer il-1)
+        if let Some(df) = &mut rt.dflash {
+            if let Some(idx) = df.layer_ids.iter().position(|&x| x == il) {
+                let feat_w = df.layer_ids.len() * s.n_embd as usize * 4;
+                let row = s.n_embd as usize * 4;
+                for tok in 0..t as usize {
+                    let slot = (pos as usize + tok) % RING_CAP;
+                    kernels::copy_d2d(
+                        &mut df.ring,
+                        slot * feat_w + idx * row,
+                        &st.cur,
+                        tok * row,
+                        row,
+                    )?;
+                }
+            }
+        }
+
         kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, t, eps)?;
 
         if let Some(gdn) = &w.gdn {
@@ -543,24 +562,6 @@ impl Model {
         self.dsv4_moe(st, &selected, gate_exps, up_exps, down_exps, 0, t)?;
         kernels::add(&mut st.ffn_out, &st.moe_out, &st.shared_out, t * s.n_embd)?;
         kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, t * s.n_embd)?;
-
-        // ---- DFlash feature capture (layer OUTPUT = input to il+1)
-        if let Some(df) = &mut rt.dflash {
-            if let Some(idx) = df.layer_ids.iter().position(|&x| x == il) {
-                let feat_w = df.layer_ids.len() * s.n_embd as usize * 4;
-                let row = s.n_embd as usize * 4;
-                for tok in 0..t as usize {
-                    let slot = (pos as usize + tok) % RING_CAP;
-                    kernels::copy_d2d(
-                        &mut df.ring,
-                        slot * feat_w + idx * row,
-                        &st.cur,
-                        tok * row,
-                        row,
-                    )?;
-                }
-            }
-        }
         Ok(())
     }
 }
