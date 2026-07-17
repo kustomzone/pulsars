@@ -66,9 +66,19 @@ fn sign_mask(s7: u32) -> u32 {
 }
 
 /// One expert row (n columns, iq2_xxs) dotted against a q8_K activation
-/// row. Scalar reference/workhorse; SIMD lands only if the bench says
-/// threads alone don't reach RAM bandwidth.
+/// row. Dispatches to AVX2 on x86 (bitwise identical to scalar: the
+/// per-block bsum is exact integer math in both paths, and the float
+/// accumulation order is the same).
 pub fn vec_dot_iq2_xxs_q8_k(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        return unsafe { avx2::vec_dot(row, x, n) };
+    }
+    vec_dot_iq2_xxs_q8_k_scalar(row, x, n)
+}
+
+/// Scalar reference/fallback.
+pub fn vec_dot_iq2_xxs_q8_k_scalar(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
     debug_assert_eq!(n % QK_K, 0);
     let t = tables();
     let nb = n / QK_K;
@@ -98,6 +108,79 @@ pub fn vec_dot_iq2_xxs_q8_k(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
         total += 0.125 * xd * x.d[ibl] * bsum as f32;
     }
     total
+}
+
+/// AVX2 path: one ymm per 32-value sub-block. Grid bytes are unsigned
+/// magnitudes (<= 43), signs applied to q8 via a +-1 byte table and
+/// sign_epi8, then maddubs (max pair sum 2*43*127 < i16::MAX, no
+/// saturation) + madd -> i32, scaled by ls per sub-block.
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use super::*;
+    use std::arch::x86_64::*;
+
+    /// 128 u64s: byte i = 0xFF where sign bit i of the parity-completed
+    /// mask is set, else 0x01.
+    const fn build_ksigns64() -> [u64; 128] {
+        let mut t = [0u64; 128];
+        let mut m = 0u32;
+        while m < 128 {
+            let full = m | ((m.count_ones() & 1) << 7);
+            let mut w = 0u64;
+            let mut i = 0;
+            while i < 8 {
+                w |= (if (full >> i) & 1 == 1 { 0xFFu64 } else { 0x01u64 }) << (8 * i);
+                i += 1;
+            }
+            t[m as usize] = w;
+            m += 1;
+        }
+        t
+    }
+    static KSIGNS64: [u64; 128] = build_ksigns64();
+
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn vec_dot(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
+        let t = tables();
+        let nb = n / QK_K;
+        debug_assert!(row.len() >= nb * IQ2_XXS_BLOCK_BYTES);
+        let ones = _mm256_set1_epi16(1);
+        let mut total = 0f32;
+        for ibl in 0..nb {
+            let blk = row.as_ptr().add(ibl * IQ2_XXS_BLOCK_BYTES);
+            let xd = f16_to_f32(u16::from_le_bytes([*blk, *blk.add(1)]));
+            let q8 = x.qs.as_ptr().add(ibl * QK_K);
+            let mut acc = _mm256_setzero_si256();
+            for ib32 in 0..QK_K / 32 {
+                let p = blk.add(2 + 8 * ib32);
+                let aux0 = (p as *const u32).read_unaligned();
+                let aux1 = (p.add(4) as *const u32).read_unaligned();
+                let ls = (2 * (aux1 >> 28) + 1) as i32;
+                let grid = _mm256_set_epi64x(
+                    t.grid[((aux0 >> 24) & 0xff) as usize] as i64,
+                    t.grid[((aux0 >> 16) & 0xff) as usize] as i64,
+                    t.grid[((aux0 >> 8) & 0xff) as usize] as i64,
+                    t.grid[(aux0 & 0xff) as usize] as i64,
+                );
+                let signs = _mm256_set_epi64x(
+                    KSIGNS64[((aux1 >> 21) & 127) as usize] as i64,
+                    KSIGNS64[((aux1 >> 14) & 127) as usize] as i64,
+                    KSIGNS64[((aux1 >> 7) & 127) as usize] as i64,
+                    KSIGNS64[(aux1 & 127) as usize] as i64,
+                );
+                let q8v = _mm256_loadu_si256(q8.add(32 * ib32) as *const __m256i);
+                let d16 = _mm256_maddubs_epi16(grid, _mm256_sign_epi8(q8v, signs));
+                let d32 = _mm256_madd_epi16(d16, ones);
+                acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(d32, _mm256_set1_epi32(ls)));
+            }
+            let s = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+            let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b0100_1110));
+            let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b1011_0001));
+            let bsum = _mm_cvtsi128_si32(s);
+            total += 0.125 * xd * *x.d.get_unchecked(ibl) * bsum as f32;
+        }
+        total
+    }
 }
 
 /// Scalar dequant of an iq2_xxs row to f32 (unit-test reference only).
@@ -158,5 +241,24 @@ mod tests {
         // and the quantization itself must be sane vs the true dot
         let true_dot: f64 = src.iter().zip(&act).map(|(&a, &b)| a as f64 * b as f64).sum();
         assert!(reference.signum() == true_dot.signum() || true_dot.abs() < 1.0);
+    }
+
+    /// bsum is exact integer math in both paths and the float ops run in
+    /// the same order, so SIMD must match scalar bit for bit.
+    #[test]
+    fn simd_matches_scalar_bitwise() {
+        let n = 5120;
+        let mut st = 7u64;
+        let ones = vec![1f32; n];
+        for trial in 0..8 {
+            let src: Vec<f32> = (0..n).map(|_| lcg(&mut st) * (trial + 1) as f32).collect();
+            let act: Vec<f32> = (0..n).map(|_| lcg(&mut st)).collect();
+            let mut row = Vec::new();
+            crate::iq::quantize_row_iq2_xxs(&src, &ones, &mut row);
+            let xq = quantize_row_q8_k(&act);
+            let a = vec_dot_iq2_xxs_q8_k(&row, &xq, n);
+            let b = vec_dot_iq2_xxs_q8_k_scalar(&row, &xq, n);
+            assert_eq!(a.to_bits(), b.to_bits(), "trial {trial}: {a} vs {b}");
+        }
     }
 }
