@@ -2820,7 +2820,10 @@ mod real {
             // DSA indexer buffers live beside the attn stack (same device)
             let has_idx = s.n_idx_topk > 0 && s.family == Family::Mla;
             let mut idx_kcache = Vec::new();
-            for il in 0..s.n_exec_layer as usize {
+            // n_kv_slots, not n_exec_layer: the MTP draft layer runs the
+            // same MLA path as slot n_exec_layer and maintains its own
+            // indexer keys
+            for il in 0..n_kv_slots {
                 idx_kcache.push(if has_idx && uses_full_indexer(il, s.n_leading_dense) {
                     DeviceBuf::alloc(ctx as usize * s.n_idx_dim as usize * 2)? // f16 keys
                 } else {
