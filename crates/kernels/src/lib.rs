@@ -600,6 +600,34 @@ mod real {
             )
         }
 
+        /// Queue async H2D from an arbitrary host pointer. The bytes must
+        /// remain valid until a matching `wait_default` / `synchronize`
+        /// (expert host-cache slabs: pinned, owned by StreamingStore).
+        pub fn copy_h2d_raw(
+            &self,
+            dst: &mut DeviceBuf,
+            dst_off: usize,
+            src: *const u8,
+            bytes: usize,
+        ) -> Result {
+            assert!(dst_off + bytes <= dst.bytes);
+            if bytes == 0 {
+                return Ok(());
+            }
+            check_rt(
+                unsafe {
+                    cudaMemcpyAsync(
+                        (dst.ptr as *mut u8).add(dst_off) as *mut c_void,
+                        src as *const c_void,
+                        bytes,
+                        H2D,
+                        self.stream,
+                    )
+                },
+                "async h2d raw",
+            )
+        }
+
         pub fn record(&self) -> Result {
             check_rt(unsafe { cudaEventRecord(self.event, self.stream) }, "event record")
         }
@@ -607,6 +635,23 @@ mod real {
         /// True once every copy queued before the last `record` finished.
         pub fn done(&self) -> bool {
             unsafe { cudaEventQuery(self.event) == 0 }
+        }
+
+        /// Make the default stream wait for the last `record` (kernels
+        /// launched afterward see completed H2D without a full device sync).
+        pub fn wait_default(&self) -> Result {
+            check_rt(
+                unsafe { cudaStreamWaitEvent(std::ptr::null_mut(), self.event, 0) },
+                "default wait event",
+            )
+        }
+
+        /// Block the host until the last `record` completes.
+        pub fn synchronize(&self) -> Result {
+            extern "C" {
+                fn cudaEventSynchronize(e: *mut c_void) -> i32;
+            }
+            check_rt(unsafe { cudaEventSynchronize(self.event) }, "event synchronize")
         }
     }
 
