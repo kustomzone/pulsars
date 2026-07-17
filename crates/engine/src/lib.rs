@@ -1393,6 +1393,168 @@ mod real {
             }
         }
 
+        /// One MoE layer's worth of CPU-lane work, shared by both resolve
+        /// paths (eval_layer's full resolve and the lean dsv4_moe). The
+        /// caller does site-specific eligibility + slab peeking + pinning;
+        /// Lane owns the two compute stages. Buffers are raw-pointer-
+        /// shared with the pool, so between submit_a() and the WaitGuard
+        /// join nothing may push into a Lane field (heap blocks are
+        /// stable across moves of the Lane itself).
+        pub struct Lane {
+            pub idx: std::collections::HashMap<i32, usize>,
+            ptrs: Vec<[SendPtr; 3]>,
+            pairs: Vec<Vec<(usize, f32)>>,
+            xqs: Vec<quant::cpu_dot::Q8KRow>,
+            mids: Vec<f32>,
+            gq: u32,
+            dq: u32,
+            grb: usize,
+            drb: usize,
+            ne: usize,
+            nf: usize,
+            act_op: u32,
+        }
+
+        impl Lane {
+            #[allow(clippy::too_many_arguments)]
+            pub fn new(gq: u32, dq: u32, grb: usize, drb: usize, ne: usize, nf: usize, act_op: u32) -> Lane {
+                Lane {
+                    idx: std::collections::HashMap::new(),
+                    ptrs: Vec::new(),
+                    pairs: Vec::new(),
+                    xqs: Vec::new(),
+                    mids: Vec::new(),
+                    gq, dq, grb, drb, ne, nf, act_op,
+                }
+            }
+
+            /// register expert e; up must already include any fused offset
+            pub fn add(&mut self, e: i32, gate: *const u8, up: *const u8, down: *const u8) {
+                self.idx.insert(e, self.ptrs.len());
+                self.ptrs.push([SendPtr(gate), SendPtr(up), SendPtr(down)]);
+                self.pairs.push(Vec::new());
+            }
+
+            pub fn is_empty(&self) -> bool {
+                self.idx.is_empty()
+            }
+
+            /// attach (token, weight) pairs from the routed slots, quantize
+            /// activations, fan out gate/up + glu jobs. Returns the job
+            /// count for a WaitGuard.
+            pub fn submit_a(
+                &mut self,
+                pool: &Pool,
+                selected: &[i32],
+                n_used: usize,
+                normed: &[f32],
+                rw: &[f32],
+                n_tok: usize,
+            ) -> usize {
+                for (si, &e) in selected.iter().enumerate() {
+                    if let Some(&ci) = self.idx.get(&e) {
+                        self.pairs[ci].push((si / n_used, rw[si]));
+                    }
+                }
+                let ne = self.ne;
+                self.xqs = (0..n_tok)
+                    .map(|t| quant::cpu_dot::quantize_row_q8_k(&normed[t * ne..(t + 1) * ne]))
+                    .collect();
+                let npairs: usize = self.pairs.iter().map(|p| p.len()).sum();
+                self.mids = vec![0f32; npairs * self.nf];
+                let (nf, grb, gq, act_op) = (self.nf, self.grb, self.gq, self.act_op);
+                let xq_ptr = SendPtr(self.xqs.as_ptr() as *const u8);
+                let mut jobs: Vec<Job> = Vec::new();
+                let mut mid_base = 0usize;
+                for (ci, pairs) in self.pairs.iter().enumerate() {
+                    let [gp, up_, _] = self.ptrs[ci];
+                    let mid = SendMut(unsafe { self.mids.as_mut_ptr().add(mid_base * nf) });
+                    mid_base += pairs.len();
+                    for lo in (0..nf).step_by(256) {
+                        let hi = (lo + 256).min(nf);
+                        let pairs = pairs.clone();
+                        jobs.push(Box::new(move || unsafe {
+                            for j in lo..hi {
+                                let g_row = std::slice::from_raw_parts(gp.get().add(j * grb), grb);
+                                let u_row = std::slice::from_raw_parts(up_.get().add(j * grb), grb);
+                                for (pi, &(tok, w)) in pairs.iter().enumerate() {
+                                    let xq = &*(xq_ptr.get() as *const quant::cpu_dot::Q8KRow).add(tok);
+                                    let g = dot(gq, g_row, xq, ne);
+                                    let u = dot(gq, u_row, xq, ne);
+                                    *mid.get().add(pi * nf + j) = glu(g, u, act_op) * w;
+                                }
+                            }
+                        }));
+                    }
+                }
+                pool.submit(jobs)
+            }
+
+            /// after the stage-A join: quantize mids, run the down-proj
+            /// fan-out, return the per-token f32 partial [n_tok * ne]
+            pub fn finish(&self, pool: &Pool, n_tok: usize) -> Vec<f32> {
+                let (ne, nf, drb, dq) = (self.ne, self.nf, self.drb, self.dq);
+                let npairs: usize = self.pairs.iter().map(|p| p.len()).sum();
+                let midq: Vec<quant::cpu_dot::Q8KRow> = (0..npairs)
+                    .map(|p| quant::cpu_dot::quantize_row_q8_k(&self.mids[p * nf..(p + 1) * nf]))
+                    .collect();
+                let mut per_tok: Vec<Vec<(SendPtr, usize)>> = vec![Vec::new(); n_tok];
+                let mut mid_base = 0usize;
+                for (ci, pairs) in self.pairs.iter().enumerate() {
+                    for (pi, &(tok, _)) in pairs.iter().enumerate() {
+                        per_tok[tok].push((self.ptrs[ci][2], mid_base + pi));
+                    }
+                    mid_base += pairs.len();
+                }
+                let mut acc = vec![0f32; n_tok * ne];
+                let acc_ptr = SendMut(acc.as_mut_ptr());
+                let midq_ptr = SendPtr(midq.as_ptr() as *const u8);
+                let mut jobs: Vec<Job> = Vec::new();
+                for (t, list) in per_tok.iter().enumerate() {
+                    if list.is_empty() {
+                        continue;
+                    }
+                    for lo in (0..ne).step_by(512) {
+                        let hi = (lo + 512).min(ne);
+                        let list = list.clone();
+                        jobs.push(Box::new(move || unsafe {
+                            for r in lo..hi {
+                                let mut sum = 0f32;
+                                for &(dp, mi) in &list {
+                                    let row = std::slice::from_raw_parts(dp.get().add(r * drb), drb);
+                                    let mq = &*(midq_ptr.get() as *const quant::cpu_dot::Q8KRow).add(mi);
+                                    sum += dot(dq, row, mq, nf);
+                                }
+                                *acc_ptr.get().add(t * ne + r) = sum;
+                            }
+                        }));
+                    }
+                }
+                pool.wait(pool.submit(jobs));
+                acc
+            }
+        }
+
+        /// quants the lane can compute; extend together with dot()
+        pub fn supported(quant: u32) -> bool {
+            [
+                kernels::QUANT_IQ2_XXS,
+                kernels::QUANT_Q2_K,
+                kernels::QUANT_Q3_K,
+                kernels::QUANT_Q4_K,
+            ]
+            .contains(&quant)
+        }
+
+        pub fn dot(quant: u32, row: &[u8], xq: &quant::cpu_dot::Q8KRow, n: usize) -> f32 {
+            match quant {
+                q if q == kernels::QUANT_Q2_K => quant::cpu_dot::vec_dot_q2_k_q8_k(row, xq, n),
+                q if q == kernels::QUANT_Q3_K => quant::cpu_dot::vec_dot_q3_k_q8_k(row, xq, n),
+                q if q == kernels::QUANT_Q4_K => quant::cpu_dot::vec_dot_q4_k_q8_k(row, xq, n),
+                _ => quant::cpu_dot::vec_dot_iq2_xxs_q8_k(row, xq, n),
+            }
+        }
+
         /// mirrors pulsar_glu in pulsar_kernels.cu (0 = silu, 1 = gelu
         /// tanh, 2 = swiglu_oai, 3 = deepseek4 clamped silu)
         pub fn glu(g: f32, u: f32, op: u32) -> f32 {
@@ -4164,17 +4326,21 @@ mod real {
                             && !st.unified
                             && s.n_embd % 256 == 0
                             && s.n_ff_exp % 256 == 0
-                            && [gate_exps.quant, up_exps.quant, down_exps.quant]
+                            && gate_exps.quant == up_exps.quant
+                            && [gate_exps.quant, down_exps.quant]
                                 .iter()
-                                .all(|&q| q == kernels::QUANT_IQ2_XXS);
+                                .all(|&q| cpu_tier::supported(q));
                         let n_used = s.n_expert_used as usize;
                         let (ne, nf) = (s.n_embd as usize, s.n_ff_exp as usize);
-                        let mut cpu_idx: std::collections::HashMap<i32, usize> =
-                            std::collections::HashMap::new();
-                        let mut cpu_ptr: Vec<[cpu_tier::SendPtr; 3]> = Vec::new();
-                        let mut cpu_pairs: Vec<Vec<(usize, f32)>> = Vec::new();
-                        let mut cpu_xqs: Vec<quant::cpu_dot::Q8KRow> = Vec::new();
-                        let mut cpu_mids: Vec<f32> = Vec::new();
+                        let mut lane = cpu_tier::Lane::new(
+                            gate_exps.quant,
+                            down_exps.quant,
+                            gate_exps.row_bytes as usize,
+                            down_exps.row_bytes as usize,
+                            ne,
+                            nf,
+                            s.moe_act_op,
+                        );
                         let mut cpu_guard: Option<cpu_tier::WaitGuard> = None;
                         if cpu_on {
                             let mut pins = Vec::new();
@@ -4185,13 +4351,14 @@ mod real {
                                 let [g3, u3, d3] = slabs_of(e as u32);
                                 let (go, uo, dno) =
                                     (off_of(g3.0, g3.1), off_of(u3.0, u3.1), off_of(d3.0, d3.1));
+                                // host-cached => CPU lane, even when a slab
+                                // also sits in dev_cache: exclusion made
+                                // ownership a first-touch race, bistable
+                                // run to run (GLM oscillated 1.6-2.8).
                                 if self
                                     .mtp
                                     .as_ref()
                                     .is_some_and(|mt| mt.res_map.contains_key(&go))
-                                    || st.dev_cache.map.contains_key(&go)
-                                    || st.dev_cache.map.contains_key(&uo)
-                                    || st.dev_cache.map.contains_key(&dno)
                                 {
                                     continue;
                                 }
@@ -4202,79 +4369,18 @@ mod real {
                                 ) else {
                                     continue;
                                 };
-                                cpu_idx.insert(e, cpu_ptr.len());
-                                cpu_ptr.push([
-                                    cpu_tier::SendPtr(gp.0),
-                                    cpu_tier::SendPtr(unsafe {
-                                        upp.0.add(*fused_up_off as usize)
-                                    }),
-                                    cpu_tier::SendPtr(dp.0),
-                                ]);
-                                cpu_pairs.push(Vec::new());
+                                lane.add(e, gp.0, unsafe { upp.0.add(*fused_up_off as usize) }, dp.0);
                                 pins.extend([go, uo, dno]);
                             }
                             st.store.pinned = pins;
                         }
-                        if !cpu_idx.is_empty() {
+                        if !lane.is_empty() {
                             let rw = st.router_weights.read_f32(n_tok as usize * n_used)?;
-                            for (si, &e) in selected.iter().enumerate() {
-                                if let Some(&ci) = cpu_idx.get(&e) {
-                                    cpu_pairs[ci].push((si / n_used, rw[si]));
-                                }
-                            }
                             let normed_h = st.normed.read_f32(n_tok as usize * ne)?;
-                            cpu_xqs = (0..n_tok as usize)
-                                .map(|t| {
-                                    quant::cpu_dot::quantize_row_q8_k(
-                                        &normed_h[t * ne..(t + 1) * ne],
-                                    )
-                                })
-                                .collect();
-                            let npairs: usize = cpu_pairs.iter().map(|p| p.len()).sum();
-                            cpu_mids = vec![0f32; npairs * nf];
-                            let act_op = s.moe_act_op;
-                            let grb = gate_exps.row_bytes as usize;
-                            let xq_ptr = cpu_tier::SendPtr(cpu_xqs.as_ptr() as *const u8);
-                            let mut jobs: Vec<cpu_tier::Job> = Vec::new();
-                            let mut mid_base = 0usize;
-                            for (ci, pairs) in cpu_pairs.iter().enumerate() {
-                                let [gp, up_, _] = cpu_ptr[ci];
-                                let mid = cpu_tier::SendMut(unsafe {
-                                    cpu_mids.as_mut_ptr().add(mid_base * nf)
-                                });
-                                mid_base += pairs.len();
-                                for lo in (0..nf).step_by(256) {
-                                    let hi = (lo + 256).min(nf);
-                                    let pairs = pairs.clone();
-                                    jobs.push(Box::new(move || unsafe {
-                                        for j in lo..hi {
-                                            let g_row = std::slice::from_raw_parts(
-                                                gp.get().add(j * grb), grb,
-                                            );
-                                            let u_row = std::slice::from_raw_parts(
-                                                up_.get().add(j * grb), grb,
-                                            );
-                                            for (pi, &(tok, w)) in pairs.iter().enumerate() {
-                                                let xq = &*(xq_ptr.get()
-                                                    as *const quant::cpu_dot::Q8KRow)
-                                                    .add(tok);
-                                                let g = quant::cpu_dot::vec_dot_iq2_xxs_q8_k(
-                                                    g_row, xq, ne,
-                                                );
-                                                let u = quant::cpu_dot::vec_dot_iq2_xxs_q8_k(
-                                                    u_row, xq, ne,
-                                                );
-                                                *mid.get().add(pi * nf + j) =
-                                                    cpu_tier::glu(g, u, act_op) * w;
-                                            }
-                                        }
-                                    }));
-                                }
-                            }
                             let pool = st.cpu_pool.as_ref().unwrap();
                             cpu_guard = Some(cpu_tier::WaitGuard {
                                 pool,
-                                n: pool.submit(jobs),
+                                n: lane.submit_a(pool, &selected, n_used, &normed_h, &rw, n_tok as usize),
                             });
                         }
                         let mut offsets =
@@ -4289,14 +4395,11 @@ mod real {
                                 }
                                 continue;
                             }
-                            if cpu_idx.contains_key(&e) {
-                                // CPU-lane experts: no fetch, no upload;
-                                // keep their VRAM-census heat warm like the
-                                // tier branch does
-                                for (t, le) in slabs_of(e as u32) {
-                                    let off = off_of(t, le);
-                                    st.dev_cache.touch.entry(off).or_insert((0, t.expert_bytes)).0 += 1;
-                                }
+                            if lane.idx.contains_key(&e) {
+                                // CPU-lane experts: no fetch, no upload,
+                                // and NO census touch - bumping their heat
+                                // gets them VRAM-seeded at next load, which
+                                // churns the cache equilibrium run to run.
                                 continue;
                             }
                             for (t, le) in slabs_of(e as u32) {
@@ -4448,7 +4551,7 @@ mod real {
                                 }
                                 continue;
                             }
-                            if cpu_idx.contains_key(&e) {
+                            if lane.idx.contains_key(&e) {
                                 ptrs.push(ExpertPtrs::NULL);
                                 continue;
                             }
@@ -4727,70 +4830,20 @@ mod real {
                             }
                         }
 
-                        // CPU-lane join: stage A (gate/up + glu) ran under
-                        // the resolve and the GPU launches above; down-proj
-                        // partials fan out here while those kernels are
-                        // still in flight, then a single f32 upload joins
-                        // moe_out on the primary stream.
-                        if !cpu_idx.is_empty() {
+                        // CPU-lane join: stage A ran under the resolve
+                        // and the GPU launches above; the down-proj fan-out
+                        // runs here while those kernels are in flight, then
+                        // one f32 upload joins moe_out on the primary.
+                        if !lane.is_empty() {
                             drop(cpu_guard.take());
                             let t_cpu = std::time::Instant::now();
-                            let npairs: usize = cpu_pairs.iter().map(|p| p.len()).sum();
-                            let midq: Vec<quant::cpu_dot::Q8KRow> = (0..npairs)
-                                .map(|p| {
-                                    quant::cpu_dot::quantize_row_q8_k(
-                                        &cpu_mids[p * nf..(p + 1) * nf],
-                                    )
-                                })
-                                .collect();
-                            let mut per_tok: Vec<Vec<(cpu_tier::SendPtr, usize)>> =
-                                vec![Vec::new(); n_tok as usize];
-                            let mut mid_base = 0usize;
-                            for (ci, pairs) in cpu_pairs.iter().enumerate() {
-                                for (pi, &(tok, _)) in pairs.iter().enumerate() {
-                                    per_tok[tok].push((cpu_ptr[ci][2], mid_base + pi));
-                                }
-                                mid_base += pairs.len();
-                            }
-                            let mut acc = vec![0f32; n_tok as usize * ne];
-                            let drb = down_exps.row_bytes as usize;
-                            let acc_ptr = cpu_tier::SendMut(acc.as_mut_ptr());
-                            let midq_ptr = cpu_tier::SendPtr(midq.as_ptr() as *const u8);
-                            let mut jobs: Vec<cpu_tier::Job> = Vec::new();
-                            for (t, list) in per_tok.iter().enumerate() {
-                                if list.is_empty() {
-                                    continue;
-                                }
-                                for lo in (0..ne).step_by(512) {
-                                    let hi = (lo + 512).min(ne);
-                                    let list = list.clone();
-                                    jobs.push(Box::new(move || unsafe {
-                                        for r in lo..hi {
-                                            let mut sum = 0f32;
-                                            for &(dp, mi) in &list {
-                                                let row = std::slice::from_raw_parts(
-                                                    dp.get().add(r * drb), drb,
-                                                );
-                                                let mq = &*(midq_ptr.get()
-                                                    as *const quant::cpu_dot::Q8KRow)
-                                                    .add(mi);
-                                                sum += quant::cpu_dot::vec_dot_iq2_xxs_q8_k(
-                                                    row, mq, nf,
-                                                );
-                                            }
-                                            *acc_ptr.get().add(t * ne + r) = sum;
-                                        }
-                                    }));
-                                }
-                            }
                             let pool = st.cpu_pool.as_ref().unwrap();
-                            pool.wait(pool.submit(jobs));
+                            let acc = lane.finish(pool, n_tok as usize);
                             st.store.pinned.clear();
-                            st.cpu_hits += cpu_idx.len() as u64;
+                            st.cpu_hits += lane.idx.len() as u64;
                             st.prof.cpu += t_cpu.elapsed();
-                            let need = n_tok as usize * ne * 4;
-                            if st.cpu_ret.bytes() < need {
-                                st.cpu_ret = DeviceBuf::alloc(need)?;
+                            if st.cpu_ret.bytes() < acc.len() * 4 {
+                                st.cpu_ret = DeviceBuf::alloc(acc.len() * 4)?;
                             }
                             st.cpu_ret.write(0, kernels::as_bytes(&acc))?;
                             kernels::add_assign(&mut st.moe_out, &st.cpu_ret, n_tok * s.n_embd)?;

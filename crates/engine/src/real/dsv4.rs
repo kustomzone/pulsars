@@ -1053,6 +1053,61 @@ impl Model {
                 }
             }
         }
+        // CPU expert lane (PULSAR_CPU=1): same contract as the full
+        // resolve - host-cached experts compute on the worker pool, no
+        // fetch, no upload, partial joins moe_out after the tier gather.
+        let cpu_on = st.cpu_pool.is_some()
+            && n_tok <= 8
+            && !st.unified
+            && s.n_embd % 256 == 0
+            && s.n_ff_exp % 256 == 0
+            && gate_exps.quant == up_exps.quant
+            && [gate_exps.quant, down_exps.quant]
+                .iter()
+                .all(|&q| super::cpu_tier::supported(q));
+        let mut lane = super::cpu_tier::Lane::new(
+            gate_exps.quant,
+            down_exps.quant,
+            gate_exps.row_bytes as usize,
+            down_exps.row_bytes as usize,
+            s.n_embd as usize,
+            s.n_ff_exp as usize,
+            act_op,
+        );
+        let mut cpu_guard: Option<super::cpu_tier::WaitGuard> = None;
+        if cpu_on {
+            let mut pins = Vec::new();
+            for &e in &distinct {
+                if tier_map.contains_key(&e) {
+                    continue;
+                }
+                let go = gate_exps.abs_offset + e as u64 * gate_exps.expert_bytes;
+                let uo = up_exps.abs_offset + e as u64 * up_exps.expert_bytes;
+                let dno = down_exps.abs_offset + e as u64 * down_exps.expert_bytes;
+                if self.mtp.as_ref().is_some_and(|mt| mt.res_map.contains_key(&go)) {
+                    continue;
+                }
+                let (Some(gp), Some(upp), Some(dp)) = (
+                    st.store.peek_ptr(go),
+                    st.store.peek_ptr(uo),
+                    st.store.peek_ptr(dno),
+                ) else {
+                    continue;
+                };
+                lane.add(e, gp.0, upp.0, dp.0);
+                pins.extend([go, uo, dno]);
+            }
+            st.store.pinned = pins;
+        }
+        if !lane.is_empty() {
+            let rw = st.router_weights.read_f32(n_tok as usize * s.n_expert_used as usize)?;
+            let normed_h = st.normed.read_f32(n_tok as usize * s.n_embd as usize)?;
+            let pool = st.cpu_pool.as_ref().unwrap();
+            cpu_guard = Some(super::cpu_tier::WaitGuard {
+                pool,
+                n: lane.submit_a(pool, selected, s.n_expert_used as usize, &normed_h, &rw, n_tok as usize),
+            });
+        }
         let mut offsets = Vec::with_capacity(3 * distinct.len());
         for &e in &distinct {
             if tier_map.contains_key(&e) {
@@ -1062,6 +1117,11 @@ impl Model {
                     let off = t.abs_offset + e as u64 * t.expert_bytes;
                     st.dev_cache.touch.entry(off).or_insert((0, t.expert_bytes)).0 += 1;
                 }
+                continue;
+            }
+            if lane.idx.contains_key(&e) {
+                // no fetch, no upload, no census touch (touch would get
+                // them VRAM-seeded next load and churn the equilibrium)
                 continue;
             }
             for t in [gate_exps, up_exps, down_exps] {
@@ -1130,6 +1190,10 @@ impl Model {
                 ptrs.push(kernels::ExpertPtrs::NULL);
                 tptrs[ti][si] = tp;
                 tier_slots[ti] += 1;
+                continue;
+            }
+            if lane.idx.contains_key(&e) {
+                ptrs.push(kernels::ExpertPtrs::NULL);
                 continue;
             }
             ptrs.push(kernels::ExpertPtrs {
@@ -1258,6 +1322,24 @@ impl Model {
             kernels::copy_across(&mut st.tier_ret, &tier.out, n)?;
             kernels::set_device(primary)?;
             kernels::add_assign(&mut st.moe_out, &st.tier_ret, n_tok * s.n_embd)?;
+        }
+
+        // CPU-lane join: stage A ran under ensure_with + the launches
+        // above; down-proj partials compute here while the GPU kernels
+        // are still in flight, then one f32 upload joins moe_out.
+        if !lane.is_empty() {
+            drop(cpu_guard.take());
+            let t_cpu = std::time::Instant::now();
+            let pool = st.cpu_pool.as_ref().unwrap();
+            let acc = lane.finish(pool, n_tok as usize);
+            st.store.pinned.clear();
+            st.cpu_hits += lane.idx.len() as u64;
+            st.prof.cpu += t_cpu.elapsed();
+            if st.cpu_ret.bytes() < acc.len() * 4 {
+                st.cpu_ret = DeviceBuf::alloc(acc.len() * 4)?;
+            }
+            st.cpu_ret.write(0, kernels::as_bytes(&acc))?;
+            kernels::add_assign(&mut st.moe_out, &st.cpu_ret, n_tok * s.n_embd)?;
         }
         Ok(())
     }
