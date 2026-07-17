@@ -641,13 +641,17 @@ pub fn generate_dflash(
             break;
         }
         // 1. draft
+        let t0 = std::time::Instant::now();
         let draft_tok = model.dflash_draft(st, draft, committed, last_tok)?;
         st.mtp_drafted += (bs - 1) as u64;
+        let t_draft = t0.elapsed();
         // 2. snapshot + batched verify
+        let t0 = std::time::Instant::now();
         st.qwen35.as_mut().unwrap().snapshot()?;
         let all = model
             .forward_rows(st, &draft_tok, committed, bs as u32)?
             .ok_or("no verify logits")?;
+        let t_verify = t0.elapsed();
         let target_tok: Vec<u32> =
             (0..bs).map(|i| argmax(&all[i * v..(i + 1) * v])).collect();
         if std::env::var_os("PULSAR_DFLASH_DEBUG").is_some() {
@@ -662,8 +666,18 @@ pub fn generate_dflash(
         st.mtp_accepted += (accept_n - 1) as u64;
         // 4. restore + replay the accepted prefix (deterministic kernels:
         //    identical values land in the caches and the feature ring)
+        let t0 = std::time::Instant::now();
         st.qwen35.as_mut().unwrap().restore()?;
         model.forward_rows(st, &draft_tok[..accept_n], committed, 0)?;
+        let t_replay = t0.elapsed();
+        if std::env::var_os("PULSAR_DFLASH_DEBUG").is_some() {
+            eprintln!(
+                "dflash timing: draft {:.0}ms verify {:.0}ms replay({accept_n}) {:.0}ms",
+                t_draft.as_secs_f64() * 1e3,
+                t_verify.as_secs_f64() * 1e3,
+                t_replay.as_secs_f64() * 1e3
+            );
+        }
         // 5. emit (stop tokens are forwarded into state but not
         //    emitted, matching engine::generate)
         let mut hit_stop = false;
