@@ -1185,6 +1185,18 @@ mod real {
         #[derive(Clone, Copy)]
         pub struct SendMut(pub *mut f32);
         unsafe impl Send for SendMut {}
+        // accessors, not .0: edition-2021 closures capture the raw-ptr
+        // FIELD on .0 (not Send); a method call captures the wrapper
+        impl SendPtr {
+            pub fn get(self) -> *const u8 {
+                self.0
+            }
+        }
+        impl SendMut {
+            pub fn get(self) -> *mut f32 {
+                self.0
+            }
+        }
 
         pub struct Pool {
             tx: std::sync::mpsc::Sender<Job>,
@@ -3966,13 +3978,13 @@ mod real {
                                     jobs.push(Box::new(move || unsafe {
                                         for j in lo..hi {
                                             let g_row = std::slice::from_raw_parts(
-                                                gp.0.add(j * grb), grb,
+                                                gp.get().add(j * grb), grb,
                                             );
                                             let u_row = std::slice::from_raw_parts(
-                                                up_.0.add(j * grb), grb,
+                                                up_.get().add(j * grb), grb,
                                             );
                                             for (pi, &(tok, w)) in pairs.iter().enumerate() {
-                                                let xq = &*(xq_ptr.0
+                                                let xq = &*(xq_ptr.get()
                                                     as *const quant::cpu_dot::Q8KRow)
                                                     .add(tok);
                                                 let g = quant::cpu_dot::vec_dot_iq2_xxs_q8_k(
@@ -3981,7 +3993,7 @@ mod real {
                                                 let u = quant::cpu_dot::vec_dot_iq2_xxs_q8_k(
                                                     u_row, xq, ne,
                                                 );
-                                                *mid.0.add(pi * nf + j) =
+                                                *mid.get().add(pi * nf + j) =
                                                     cpu_tier::glu(g, u, act_op) * w;
                                             }
                                         }
@@ -4369,16 +4381,16 @@ mod real {
                                             let mut sum = 0f32;
                                             for &(dp, mi) in &list {
                                                 let row = std::slice::from_raw_parts(
-                                                    dp.0.add(r * drb), drb,
+                                                    dp.get().add(r * drb), drb,
                                                 );
-                                                let mq = &*(midq_ptr.0
+                                                let mq = &*(midq_ptr.get()
                                                     as *const quant::cpu_dot::Q8KRow)
                                                     .add(mi);
                                                 sum += quant::cpu_dot::vec_dot_iq2_xxs_q8_k(
                                                     row, mq, nf,
                                                 );
                                             }
-                                            *acc_ptr.0.add(t * ne + r) = sum;
+                                            *acc_ptr.get().add(t * ne + r) = sum;
                                         }
                                     }));
                                 }
