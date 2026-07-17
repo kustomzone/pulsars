@@ -17,6 +17,7 @@
 mod real {
     mod dsv4;
     mod qwen35;
+    pub use qwen35::{generate_dflash, DraftModel};
 
     use std::fs::File;
     use std::os::unix::fs::FileExt;

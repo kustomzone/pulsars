@@ -62,9 +62,6 @@ struct DflashRt {
     /// captured target features [RING_CAP][n_capture * n_embd] f32,
     /// slot = position % RING_CAP
     ring: DeviceBuf,
-    /// window gather scratch [RING_CAP][n_capture * n_embd] (in
-    /// position order for the draft's rebased rope)
-    feat_in: DeviceBuf,
     /// pre-verify snapshots (S + conv per GDN layer)
     snap_s: Vec<Option<DeviceBuf>>,
     snap_conv: Vec<Option<DeviceBuf>>,
@@ -169,7 +166,6 @@ impl Qwen35Rt {
         }
         self.dflash = Some(DflashRt {
             ring: DeviceBuf::alloc(RING_CAP * feat_w * 4)?,
-            feat_in: DeviceBuf::alloc(RING_CAP * feat_w * 4)?,
             snap_s,
             snap_conv,
             layer_ids,
@@ -308,6 +304,7 @@ impl DraftModel {
         let f32s = |n: usize| DeviceBuf::alloc(n * 4);
         let bs = block_size;
         let kv_rows = RING_CAP + bs;
+        let n_cap = layer_ids.len();
         Ok(DraftModel {
             fc: up("dflash_fc.weight")?,
             hidden_norm: up("dflash_hidden_norm.weight")?,
@@ -322,6 +319,7 @@ impl DraftModel {
             rope_base,
             n_embd,
             ff,
+            feat_in: f32s(RING_CAP * n_cap * n_embd as usize)?,
             feat: f32s(RING_CAP * n_embd as usize)?,
             h: f32s(bs * n_embd as usize)?,
             hn: f32s(bs * n_embd as usize)?,
@@ -544,22 +542,15 @@ impl Model {
         let w_eff = (committed as usize).min(RING_CAP);
         let start = committed as usize - w_eff;
         let feat_w = d.layer_ids.len() * s.n_embd as usize * 4;
-        // gather the window in position order
+        // gather the window in position order (the ring is slot-keyed)
         {
-            let rt = st.qwen35.as_mut().ok_or("qwen35 state missing")?;
-            let df = rt.dflash.as_mut().ok_or("dflash not enabled")?;
+            let rt = st.qwen35.as_ref().ok_or("qwen35 state missing")?;
+            let df = rt.dflash.as_ref().ok_or("dflash not enabled")?;
             for i in 0..w_eff {
                 let slot = (start + i) % RING_CAP;
-                let (feat_in, ring) = (&mut df.feat_in, &df.ring);
-                kernels::copy_d2d(feat_in, i * feat_w, ring, slot * feat_w, feat_w)?;
+                kernels::copy_d2d(&mut d.feat_in, i * feat_w, &df.ring, slot * feat_w, feat_w)?;
             }
         }
-        let rt_feat_in = {
-            // fuse: fc @ features -> rms(hidden_norm)
-            let rt = st.qwen35.as_ref().unwrap();
-            rt.dflash.as_ref().unwrap().feat_in.ptr() as usize
-        };
-        let _ = rt_feat_in; // features stay in the rt buffer; matmul below
         // noise block: [last_tok, MASK x bs-1] embedded with the target table
         let mut ids: Vec<i32> = vec![d.mask_id as i32; bs];
         ids[0] = last_tok as i32;
@@ -568,12 +559,8 @@ impl Model {
 
         let eps = s.rms_eps;
         let n_cap = d.layer_ids.len() as u32;
-        {
-            let rt = st.qwen35.take().ok_or("qwen35 state missing")?;
-            let df = rt.dflash.as_ref().ok_or("dflash not enabled")?;
-            kernels::matmul_q8_0(&mut d.feat, &d.fc, &df.feat_in, n_cap * s.n_embd, s.n_embd, w_eff as u32)?;
-            st.qwen35 = Some(rt);
-        }
+        // fuse: fc @ features -> rms(hidden_norm)
+        kernels::matmul_q8_0(&mut d.feat, &d.fc, &d.feat_in, n_cap * s.n_embd, s.n_embd, w_eff as u32)?;
         kernels::rms_norm_inplace(&mut d.feat, &d.hidden_norm, s.n_embd, w_eff as u32, eps)?;
 
         let kv_dim = d.n_kv * d.head_dim;
@@ -675,12 +662,17 @@ pub fn generate_dflash(
         //    identical values land in the caches and the feature ring)
         st.qwen35.as_mut().unwrap().restore()?;
         model.forward_rows(st, &draft_tok[..accept_n], committed, 0)?;
-        // 5. emit
+        // 5. emit (stop tokens are forwarded into state but not
+        //    emitted, matching engine::generate)
         let mut hit_stop = false;
         for &tokv in &draft_tok[..accept_n] {
+            if stop(tokv) {
+                hit_stop = true;
+                break;
+            }
             on_token(tokv);
             emitted += 1;
-            if stop(tokv) || emitted >= max_tokens {
+            if emitted >= max_tokens {
                 hit_stop = true;
                 break;
             }
