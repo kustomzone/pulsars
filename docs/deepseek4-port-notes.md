@@ -182,6 +182,29 @@ still TODO). prefill has a batch path + compressor_finish_prefill_state.
   how raw window + compressed rows compose per query - the ONE remaining
   unread region (prefill batch path included)
 
+## PERF PASS PHASE 1 (2026-07-17): Sinkhorn/HC-mix and the streaming
+## compressor now run FULLY ON DEVICE (dsv4_sinkhorn + dsv4_hc_mix_dev
+## + dsv4_comp_step kernels, both validated against serial C
+## references in dsv4_selftest; host math kept as the Rust unit-test
+## reference). Per-layer host syncs: ~5 -> 1 (the router logits read).
+## MEASURED: short-ctx decode NEUTRAL (~7.7-8.0 - dsv4 decode is
+## expert-streaming-bound, the syncs were hiding under fetch waits);
+## LONG-CTX decode +41% (6.68 vs 4.74 tok/s at 2.4k ctx - the
+## per-token host compressor pool was the long-ctx cost); needle ids
+## BYTE-IDENTICAL; short fresh prompts show greedy near-tie drift
+## (device expf vs host exp ulps - the documented drift class).
+## Tiers arrived earlier the same day (5.9 -> 8.0).
+##
+## PHASE 2 (next session): chunked batched prefill. On-device state
+## makes it feasible; layer flow = batched [hc_pre/norms/q-kv/rope/
+## fp8] -> per-token sequential [ring append, comp steps, attention]
+## -> batched [un-rope, grouped out, hc_post, ONE union MoE per chunk
+## via dsv4_moe(n_tok) which already has grouped tier launches].
+## CAREFUL: the raw SWA ring (cap 128) gets clobbered for earlier
+## tokens if all appends land before attention - the per-token
+## interleave above is load-bearing. Expected: prefill ~5 -> tens of
+## tok/s (one expert-corpus pass per 16 tokens instead of per token).
+##
 ## Status: SHIPPED 2026-07-16. Compiled first try; dsv4_selftest PASS;
 ## check.sh PASS (existing archs bit-exact); correct output on the
 ## first-ever run; needle recall at 2.4k ctx (compressed rows + live
