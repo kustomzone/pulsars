@@ -51,6 +51,15 @@ struct DflashRt {
     /// pre-verify snapshots (S + conv per GDN layer)
     snap_s: Vec<Option<DeviceBuf>>,
     snap_conv: Vec<Option<DeviceBuf>>,
+    /// fast-rollback stashes, per GDN layer: the verify chunk's raw
+    /// qkv projections [16][conv_dim] and final g/beta [16][v_heads] -
+    /// enough to replay ONLY the conv+delta recurrences after a
+    /// snapshot restore (no matmuls, no MoE, no attention)
+    stash_qkv: Vec<Option<DeviceBuf>>,
+    stash_g: Vec<Option<DeviceBuf>>,
+    stash_beta: Vec<Option<DeviceBuf>>,
+    /// stash during the CURRENT forward (set for verify passes)
+    capture_gdn: bool,
     /// capture layer ids from the draft gguf
     layer_ids: Vec<usize>,
 }
@@ -136,17 +145,29 @@ impl Qwen35Rt {
         }
         let s = m.shape;
         let feat_w = layer_ids.len() * s.n_embd as usize;
+        let key_dim = (s.ssm_k_heads * s.ssm_state) as usize;
+        let value_dim = (s.ssm_v_heads * s.ssm_state) as usize;
+        let conv_dim = 2 * key_dim + value_dim;
         let mut snap_s = Vec::new();
         let mut snap_conv = Vec::new();
+        let mut stash_qkv = Vec::new();
+        let mut stash_g = Vec::new();
+        let mut stash_beta = Vec::new();
         for gs in &self.states {
             match gs {
                 Some(g) => {
                     snap_s.push(Some(DeviceBuf::alloc(g.s.bytes())?));
                     snap_conv.push(Some(DeviceBuf::alloc(g.conv.bytes())?));
+                    stash_qkv.push(Some(DeviceBuf::alloc(T_MAX * conv_dim * 4)?));
+                    stash_g.push(Some(DeviceBuf::alloc(T_MAX * s.ssm_v_heads as usize * 4)?));
+                    stash_beta.push(Some(DeviceBuf::alloc(T_MAX * s.ssm_v_heads as usize * 4)?));
                 }
                 None => {
                     snap_s.push(None);
                     snap_conv.push(None);
+                    stash_qkv.push(None);
+                    stash_g.push(None);
+                    stash_beta.push(None);
                 }
             }
         }
@@ -154,6 +175,10 @@ impl Qwen35Rt {
             ring: DeviceBuf::alloc(RING_CAP * feat_w * 4)?,
             snap_s,
             snap_conv,
+            stash_qkv,
+            stash_g,
+            stash_beta,
+            capture_gdn: false,
             layer_ids,
         });
         Ok(())
@@ -174,6 +199,49 @@ impl Qwen35Rt {
         Ok(())
     }
 
+    /// Fast rollback: restore the pre-verify snapshots and replay ONLY
+    /// the conv + delta recurrences for the accepted prefix from the
+    /// stashed inputs - no matmuls, no MoE, no attention, no lm head.
+    /// KV caches and the feature ring already hold the correct rows
+    /// (deterministic kernels wrote identical values during verify).
+    fn rollback_to(&mut self, m: &Model, accept_n: u32) -> Result {
+        let s = m.shape;
+        let key_dim = s.ssm_k_heads * s.ssm_state;
+        let value_dim = s.ssm_v_heads * s.ssm_state;
+        let conv_dim = 2 * key_dim + value_dim;
+        let Some(df) = &self.dflash else {
+            return Err("dflash not enabled".into());
+        };
+        for (il, gs) in self.states.iter_mut().enumerate() {
+            let Some(g) = gs else { continue };
+            let ss = df.snap_s[il].as_ref().unwrap();
+            let sc = df.snap_conv[il].as_ref().unwrap();
+            kernels::copy_d2d(&mut g.s, 0, ss, 0, ss.bytes())?;
+            kernels::copy_d2d(&mut g.conv, 0, sc, 0, sc.bytes())?;
+            if accept_n == 0 {
+                continue;
+            }
+            let sq = df.stash_qkv[il].as_ref().unwrap();
+            let Attn::Qwen35(w) = &m.layers[il].attn else {
+                return Err("qwen35 layer expected".into());
+            };
+            let gdn = w.gdn.as_ref().ok_or("gdn weights missing")?;
+            kernels::qwen35_conv_batch(&mut self.conv_out, sq, &gdn.conv, &mut g.conv, conv_dim, s.ssm_conv_k, accept_n)?;
+            kernels::qwen35_split_qkv(&mut self.gq, &mut self.gk, &mut self.gv, &self.conv_out, accept_n, key_dim, value_dim)?;
+            kernels::qwen35_l2_norm(&mut self.gq, accept_n * s.ssm_k_heads, s.ssm_state, s.rms_eps)?;
+            kernels::qwen35_l2_norm(&mut self.gk, accept_n * s.ssm_k_heads, s.ssm_state, s.rms_eps)?;
+            kernels::qwen35_gdn_batch(
+                &mut self.gdn_o, &mut g.s, &self.gq, &self.gk, &self.gv,
+                df.stash_g[il].as_ref().unwrap(),
+                df.stash_beta[il].as_ref().unwrap(),
+                s.ssm_v_heads, s.ssm_k_heads, s.ssm_state, accept_n,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Full-snapshot restore (legacy path; rollback_to supersedes it).
+    #[allow(dead_code)]
     fn restore(&mut self) -> Result {
         let Some(df) = &self.dflash else {
             return Err("dflash not enabled".into());
@@ -448,6 +516,18 @@ impl Model {
             kernels::matmul_f32(&mut rt.beta, &gdn.beta_w, &st.normed, s.n_embd, s.ssm_v_heads, t)?;
             kernels::qwen35_gdn_coeffs(&mut rt.g, &mut rt.beta, &gdn.a, &gdn.dt_bias, t, s.ssm_v_heads)?;
 
+            // fast-rollback stash: the raw qkv rows + final coeffs are
+            // all a state-only replay needs
+            if let Some(df) = &mut rt.dflash {
+                if df.capture_gdn {
+                    let sq = df.stash_qkv[il].as_mut().ok_or("stash missing")?;
+                    kernels::copy_d2d(sq, 0, &rt.qkv, 0, (t * conv_dim) as usize * 4)?;
+                    let sg = df.stash_g[il].as_mut().unwrap();
+                    kernels::copy_d2d(sg, 0, &rt.g, 0, (t * s.ssm_v_heads) as usize * 4)?;
+                    let sb = df.stash_beta[il].as_mut().unwrap();
+                    kernels::copy_d2d(sb, 0, &rt.beta, 0, (t * s.ssm_v_heads) as usize * 4)?;
+                }
+            }
             let gs = rt.states[il].as_mut().ok_or("gdn state missing")?;
             kernels::qwen35_conv_batch(&mut rt.conv_out, &rt.qkv, &gdn.conv, &mut gs.conv, conv_dim, s.ssm_conv_k, t)?;
             // split [q|k|v] rows into contiguous batch buffers, one launch
@@ -645,12 +725,17 @@ pub fn generate_dflash(
         let draft_tok = model.dflash_draft(st, draft, committed, last_tok)?;
         st.mtp_drafted += (bs - 1) as u64;
         let t_draft = t0.elapsed();
-        // 2. snapshot + batched verify
+        // 2. snapshot + batched verify (gdn inputs stashed for rollback)
         let t0 = std::time::Instant::now();
-        st.qwen35.as_mut().unwrap().snapshot()?;
+        {
+            let rt = st.qwen35.as_mut().unwrap();
+            rt.snapshot()?;
+            rt.dflash.as_mut().unwrap().capture_gdn = true;
+        }
         let all = model
             .forward_rows(st, &draft_tok, committed, bs as u32)?
             .ok_or("no verify logits")?;
+        st.qwen35.as_mut().unwrap().dflash.as_mut().unwrap().capture_gdn = false;
         let t_verify = t0.elapsed();
         let target_tok: Vec<u32> =
             (0..bs).map(|i| argmax(&all[i * v..(i + 1) * v])).collect();
@@ -667,8 +752,12 @@ pub fn generate_dflash(
         // 4. restore + replay the accepted prefix (deterministic kernels:
         //    identical values land in the caches and the feature ring)
         let t0 = std::time::Instant::now();
-        st.qwen35.as_mut().unwrap().restore()?;
-        model.forward_rows(st, &draft_tok[..accept_n], committed, 0)?;
+        {
+            let mut rt = st.qwen35.take().ok_or("qwen35 state missing")?;
+            let r = rt.rollback_to(model, accept_n as u32);
+            st.qwen35 = Some(rt);
+            r?;
+        }
         let t_replay = t0.elapsed();
         if std::env::var_os("PULSAR_DFLASH_DEBUG").is_some() {
             eprintln!(
