@@ -17,7 +17,8 @@ if [ $# -ge 1 ]; then
 
     # decode vs fresh-prefill must be bit-exact on the fixed single-token
     # path (PULSAR_BATCH=1); any drift here is a real kernel/order bug
-    out=$(PULSAR_BATCH=1 "$CLI" -m "$MODEL" --ctx 256 -p "$PROMPT" \
+    # tiers reorder float adds (documented drift class) - pin them off
+    out=$(PULSAR_TIERS=off PULSAR_BATCH=1 "$CLI" -m "$MODEL" --ctx 256 -p "$PROMPT" \
         --decode-consistency 4 --temp 0 2>&1) || true
     if ! echo "$out" | grep -q 'max |dlogit| 0.0000'; then
         echo "check: FAIL decode-consistency not bit-exact"

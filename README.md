@@ -13,7 +13,7 @@ a neutron star that spins fast and emits beams.
 
 ## What it does today
 
-Eight model architectures running on consumer GPUs: **Hy3 295B**
+Nine model architectures running on consumer GPUs: **Hy3 295B**
 (hy-v3, GQA), **GLM-5.2 743B** (glm-dsa, MLA + DSA sparse attention),
 **Kimi K2.7 1T** (deepseek2, MLA + YaRN), **MiniMax M3** (partial
 rotary, swiglu_oai), **Gemma 4 26B-A4B** (interleaved sliding-window
@@ -24,13 +24,18 @@ correct output on its first-ever run), and **DeepSeek-V4-Flash 284B**
 (deepseek4: 4-stream hyper-connection residual with Sinkhorn gates,
 sink attention over a sliding window plus streaming compressed KV,
 fp8/fp4 cache quantization-aware sims, token-id hash routing on the
-early layers; also correct output on its first-ever run). Reference
+early layers; also correct output on its first-ever run), and
+**Qwen3.6-35B-A3B** (qwen35moe hybrid: Gated DeltaNet linear attention
+with O(1) recurrent state on 3 of every 4 layers, sigmoid-gated full
+attention on the rest - 262k context with KV on only 10 of 40 layers).
+Reference
 box: RTX 5060 Ti 16GB + RTX 4060 Ti 16GB, Ryzen 9900X, 30GB RAM, one
 Gen5 NVMe.
 
 | Model | Total | Active / token | gguf | Decode, warm | vs ds4, same box |
 |---|---|---|---|---|---|
 | Gemma 4 26B-A4B | 26B | 4B | 16GB (Q4_K_XL) | **41 tok/s** | – |
+| Qwen3.6-35B-A3B | 35B | 3B (top-8 of 256 + shared) | 17GB (Q3_K_XL) | **33.5 tok/s** | – |
 | DeepSeek-V4-Flash | 284B | ~8B (top-6 of 256 + shared) | 87GB (ds4 recipe) | **5.9 tok/s** | – |
 | Hy3 295B | 295B | 21B (top-8 of 192) | 79GB (IQ2_XXS) | **5.3 tok/s** | 0.64–0.70 |
 | Qwen3-235B-A22B | 235B | 22B (top-8 of 128) | 83GB (Q2_K_XL) | **4.6 tok/s** | – |
@@ -314,8 +319,10 @@ Not yet:
   unpacker per format)
 - shard-streaming quantize in `pulsar-quant` (fetch → quantize → delete,
   for BF16 sources bigger than the disk)
-- Qwen3.6 hybrid (Gated DeltaNet + gated attention): the 35B-A3B would
-  put a strong model on 1660-class GPUs
+- DFlash speculative decoding for Qwen3.6 (matched block-diffusion
+  draft + tree verify, the lucebox recipe): 6-8 accepted tokens per
+  round on a model whose weights already sit in cache is the regime
+  where speculation finally pays here
 
 ## License
 
