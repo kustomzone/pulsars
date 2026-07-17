@@ -20,7 +20,7 @@ rotary, swiglu_oai), **Gemma 4 26B-A4B** (interleaved sliding-window
 attention, dual GELU FFN), **TML Inkling 1T** (no rope, learned
 relative-position bias, shortconv streams, sink router; supported the
 day after release), **Qwen3-235B-A22B** (qwen3moe, softmax router;
-correct output on its first-ever run), and **DeepSeek-V4-Flash 284B**
+correct output on its first-ever run), **DeepSeek-V4-Flash 284B**
 (deepseek4: 4-stream hyper-connection residual with Sinkhorn gates,
 sink attention over a sliding window plus streaming compressed KV,
 fp8/fp4 cache quantization-aware sims, token-id hash routing on the
