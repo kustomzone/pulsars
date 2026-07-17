@@ -3,7 +3,7 @@
 //! RAM like real host-cache hits. Target: >40GB/s aggregate on the
 //! 9900X (PCIe H2D measures 28.7GB/s; below that the tier loses).
 //!
-//!   cpu-tier-bench [threads] [gb]
+//!   cpu-tier-bench [threads] [gb] [passes]
 
 use quant::cpu_dot::{quantize_row_q8_k, vec_dot_iq2_xxs_q8_k, IQ2_XXS_BLOCK_BYTES, QK_K};
 
@@ -13,6 +13,7 @@ fn main() {
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8),
     );
     let gb: f64 = args.next().and_then(|a| a.parse().ok()).unwrap_or(2.0);
+    let passes: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(1);
 
     // GLM-shaped rows: n_embd 5120 columns
     let n_cols = 5120usize;
@@ -52,9 +53,11 @@ fn main() {
             let xq = &xq;
             handles.push(s.spawn(move || {
                 let mut acc = 0f64;
-                for r in lo..hi {
-                    let row = &weights[r * row_bytes..(r + 1) * row_bytes];
-                    acc += vec_dot_iq2_xxs_q8_k(row, xq, n_cols) as f64;
+                for _ in 0..passes {
+                    for r in lo..hi {
+                        let row = &weights[r * row_bytes..(r + 1) * row_bytes];
+                        acc += vec_dot_iq2_xxs_q8_k(row, xq, n_cols) as f64;
+                    }
                 }
                 acc
             }));
@@ -64,6 +67,7 @@ fn main() {
         }
     });
     let dt = t0.elapsed().as_secs_f64();
+    let total_bytes = total_bytes * passes;
     eprintln!(
         "cpu-tier-bench: {:.2} GB in {:.3}s = {:.1} GB/s aggregate ({:.2} GB/s/thread), checksum {:e}",
         total_bytes as f64 / 1e9,
