@@ -169,13 +169,32 @@ equivalents + draft (~1ms) and commits accept_n+bonus (lucebox measures
 ## Sequential untouched (36.3). Round now: draft 47 + verify 107 +
 ## replay ~18/tok, committing ~2.8.
 ##
-## Remaining moves, in value order:
-## 1. acceptance 2.8 -> 6+: Q4_K_XL target (feature noise vs the
-##    bf16-trained draft), RING_CAP 2048, draft ctx-KV cache ring.
-##    At 6 commits/round the current round cost is ~29ms/token = break
-##    even; with #2 it wins.
-## 2. fast rollback (per-position GDN input stash) drops the replay
-##    (~50ms/round at current acceptance).
-## 3. draft + verify both pay ~24ms in head_logits over the q6_K vocab
-##    (row bytes re-read per token; the q8_0 head path has a tensor-
-##    core GEMM). Requant the head at load or token-tile matmul_kq.
+## ACCEPTANCE + ROLLBACK PASS (2026-07-16/17 night, final):
+## - fast GDN rollback SHIPPED: stash raw qkv rows + final g/beta per
+##   GDN layer during verify, then replay ONLY conv+delta recurrences
+##   from the snapshots (no matmuls/MoE/attention/head). Replay
+##   18ms/token -> 0ms. Output ids BYTE-IDENTICAL to sequential greedy
+##   (A/B verified), acceptance counts bit-consistent.
+## - token-tiled matmul_kq (n_tok==16): row bytes read once for all
+##   verify/draft rows.
+## - WORKLOAD >> quantization for acceptance: GSM8K-style prompt hits
+##   34% (6.1 commits/round) vs prose 14-17% on the SAME Q3 target.
+##   z-lab's 5.1-7.6 range reproduced. Q4 target did NOT raise
+##   acceptance (22% on math - different reasoning content, so not
+##   comparable row-by-row; the feature-noise hypothesis is dead).
+##
+## SCOREBOARD (block 16, greedy):
+##   Q3_K_XL target: sequential 36.3 | DFlash math 39.7 (1.09x WIN,
+##     first net-positive speculation on pulsar), prose ~22
+##   Q4_K_XL target: sequential 51.8 (!! iq3 decode compute was
+##     throttling the Q3 build - K-quants are the better ship for this
+##     model) | DFlash math 26, prose 31 - loses to its own baseline
+##
+## Round anatomy now: draft 14ms (short ctx) to 48ms (ctx ~75; grows
+## with the feature window - the ctx-KV cache ring caps it), verify
+## ~95-115ms (fixed per-layer launches + 40 router readbacks),
+## rollback ~0ms. Break-even on Q4 = ~7 commits/round; measured 4.3.
+##
+## Next (deferred): draft ctx-KV ring, CUDA-graph/fused verify
+## launches, DDTree tree verification, draft trained/evaluated at
+## bigger windows.

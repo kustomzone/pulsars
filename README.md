@@ -27,15 +27,17 @@ fp8/fp4 cache quantization-aware sims, token-id hash routing on the
 early layers; also correct output on its first-ever run), and
 **Qwen3.6-35B-A3B** (qwen35moe hybrid: Gated DeltaNet linear attention
 with O(1) recurrent state on 3 of every 4 layers, sigmoid-gated full
-attention on the rest - 262k context with KV on only 10 of 40 layers).
-Reference
+attention on the rest - 262k context with KV on only 10 of 40 layers;
+prefer K-quants for it: the Q4_K_XL decodes at 51.8 tok/s where the
+smaller Q3_K_XL manages 36, because iq3's codebook lookups are decode
+compute the simple K-quant shifts don't pay). Reference
 box: RTX 5060 Ti 16GB + RTX 4060 Ti 16GB, Ryzen 9900X, 30GB RAM, one
 Gen5 NVMe.
 
 | Model | Total | Active / token | gguf | Decode, warm | vs ds4, same box |
 |---|---|---|---|---|---|
 | Gemma 4 26B-A4B | 26B | 4B | 16GB (Q4_K_XL) | **41 tok/s** | – |
-| Qwen3.6-35B-A3B | 35B | 3B (top-8 of 256 + shared) | 17GB (Q3_K_XL) | **35.8 tok/s** | – |
+| Qwen3.6-35B-A3B | 35B | 3B (top-8 of 256 + shared) | 22GB (Q4_K_XL) | **51.8 tok/s** | – |
 | DeepSeek-V4-Flash | 284B | ~8B (top-6 of 256 + shared) | 87GB (ds4 recipe) | **5.9 tok/s** | – |
 | Hy3 295B | 295B | 21B (top-8 of 192) | 79GB (IQ2_XXS) | **5.3 tok/s** | 0.64–0.70 |
 | Qwen3-235B-A22B | 235B | 22B (top-8 of 128) | 83GB (Q2_K_XL) | **4.6 tok/s** | – |
@@ -316,21 +318,24 @@ batched target forward verifies the block, recurrent state snapshots
 roll back rejections). The machinery works - structured text accepts
 whole 16-blocks - but it ships opt-in experimental
 (`PULSAR_DFLASH=draft.gguf`) because on the reference box it is
-net-slower (14.5 vs ~36 tok/s). Two rounds of profiling closed most of
-the gap already: hybrid families now get resident expert tiers (the
-spare card serves ~98% of expert slots at VRAM speed), and verify-size
-chunks route through the grouped tensor-core MoE on the tier card
-(each expert block decodes to int8 smem once per launch instead of
-once per row) - together 6.1 -> 14.5 tok/s with sequential decode
-untouched. What remains is acceptance (2.8 of 15 drafted per round on
-a Q3 target against a bf16-trained draft; the break-even is ~6) and
-fast state rollback.
+experimental. Four profiling rounds took it from 6.1 to 39.7 tok/s
+(resident expert tiers for the hybrid families, grouped tensor-core
+MoE for verify chunks, recurrence-only fast rollback that replaces the
+replay forward, a token-tiled K-quant lm head), and on the iq3-heavy
+Q3_K_XL target it now BEATS sequential decode on reasoning workloads
+(39.7 vs 36.3, byte-identical output to plain greedy). On the faster
+Q4_K_XL target sequential decode itself jumps to 51.8 tok/s and DFlash
+falls behind again: the round's remaining fixed costs (a ~95ms verify
+floor of per-layer launches and router readbacks, a draft whose cost
+grows with the feature window) need acceptance ~7+ to amortize, and
+measured acceptance is 4.3 on math, less on prose.
 
 Not yet:
 
-- DFlash perf pass, remaining: acceptance tuning (Q4 target, bigger
-  feature window, draft context-KV ring), fast GDN rollback,
-  token-tiled K-quant lm head
+- DFlash, remaining: draft context-KV cache ring (lucebox
+  DraftKvCacheRefs - caps the draft cost at long windows), CUDA-graph
+  or fused launches for the verify's per-layer fixed costs, tree
+  verification (DDTree) for higher acceptance per round
 - deepseek4 perf pass: batched prefill (prompts currently process
   sequentially), resident tiers + cross-layer prefetch for the dsv4
   resolve, fewer host syncs on the hyper-connection gates
