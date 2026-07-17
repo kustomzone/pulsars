@@ -408,9 +408,10 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Expand "...-00001-of-000NN.gguf" to the full shard list (all must
-/// exist); None when the name doesn't match the split convention.
-pub fn split_shards(path: &std::path::Path) -> Option<Vec<std::path::PathBuf>> {
+/// Expand "...-00001-of-000NN.gguf" to the full shard name list WITHOUT
+/// checking existence (streaming quantize fetches shards on demand);
+/// None when the name doesn't match the split convention.
+pub fn split_shard_names(path: &std::path::Path) -> Option<Vec<std::path::PathBuf>> {
     let name = path.file_name()?.to_str()?;
     let stem = name.strip_suffix(".gguf")?;
     // ...-%05d-of-%05d
@@ -424,13 +425,12 @@ pub fn split_shards(path: &std::path::Path) -> Option<Vec<std::path::PathBuf>> {
         return None;
     }
     let dir = path.parent()?;
-    let mut out = Vec::with_capacity(count as usize);
-    for i in 1..=count {
-        let p = dir.join(format!("{prefix}-{i:05}-of-{count:05}.gguf"));
-        if !p.exists() {
-            return None;
-        }
-        out.push(p);
-    }
-    Some(out)
+    Some((1..=count).map(|i| dir.join(format!("{prefix}-{i:05}-of-{count:05}.gguf"))).collect())
+}
+
+/// Expand "...-00001-of-000NN.gguf" to the full shard list (all must
+/// exist); None when the name doesn't match the split convention.
+pub fn split_shards(path: &std::path::Path) -> Option<Vec<std::path::PathBuf>> {
+    let out = split_shard_names(path)?;
+    out.iter().all(|p| p.exists()).then_some(out)
 }

@@ -308,7 +308,9 @@ tensor-core prefill (dense GEMM + grouped MoE) · MiniMax M3, Qwen3,
 Gemma 4, TML Inkling forward graphs · opt-in fp8 e4m3 KV cache
 (`PULSAR_KV=fp8`) · `pulsar-quant` recipe quantizer (BF16 gguf →
 ds4-style expert mixes, iq2_xxs with imatrix, per-tensor `--map`
-rules; removes llama.cpp from the model-prep pipeline) ·
+rules; removes llama.cpp from the model-prep pipeline; shard
+streaming: `--fetch-cmd`/`--delete-shards` quantize sources bigger
+than the disk one shard at a time) ·
 DeepSeek-V4-Flash (deepseek4): hyper-connection residual streams,
 streaming compressed KV + sink attention, indexer QAT top-k, token-id
 hash routing.
@@ -344,8 +346,6 @@ Not yet:
 - tensor-core unpackers for the remaining expert formats (iq2_xs,
   iq3_xxs, q4_K, q5_1, q2_K, q3_K, the harness takes one ~40-line
   unpacker per format)
-- shard-streaming quantize in `pulsar-quant` (fetch → quantize → delete,
-  for BF16 sources bigger than the disk)
 
 ## License
 
