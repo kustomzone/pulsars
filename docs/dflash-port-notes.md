@@ -125,5 +125,34 @@ dominate (~90% of time), so a round costs ~2-4 sequential-token
 equivalents + draft (~1ms) and commits accept_n+bonus (lucebox measures
 6-8 on the 27B; MoE 35B may differ). Expected 2-3x if acceptance holds.
 
-## Status: recon COMPLETE. Implementation next: A (batched forward +
-## kernels + selftests), B (draft), C (loop), measure acceptance.
+## Status: SHIPPED as opt-in experimental (PULSAR_DFLASH=draft.gguf),
+## 2026-07-16 late. All three phases landed + two live bugs fixed:
+## (1) the draft is YARN-TRAINED (rope_scaling factor 64 / orig 4096 in
+## the z-lab config; lucebox's 27B graph hardcodes plain rope, ours
+## can't) - new neox yarn kernel, ggml attn_factor semantics;
+## (2) feature capture follows the HF hidden_states[il] convention =
+## the residual ENTERING layer il, not its output.
+##
+## MEASURED (substrate, Q3_K_XL target + Q8_0 draft, greedy n=64):
+## - mechanism correct: counting prompt accepts FULL 16-blocks; natural
+##   text ~2.8 tokens/round (12% of the 15 drafted); output coherent
+##   and deterministic across runs
+## - net throughput 6.1 tok/s vs 33.5 sequential = NET-SLOWER on this
+##   box. Root cause is the MTP lesson verbatim: a 16-row verify unions
+##   ~110 distinct experts/layer (~6.6GB weights/round) vs 8 for a
+##   sequential token, and the qwen35 lean resolve has no tiers - the
+##   union streams over PCIe every round while sequential decode rides
+##   94% VRAM cache hits.
+##
+## To flip it net-positive (the DFlash perf pass):
+## 1. expert tiers for the hybrid families: ~14GB of experts fit the
+##    idle 4060 Ti entirely; teach the lean dsv4_moe resolve the tier
+##    map (the shared eval_layer arm already has the pattern). Verify
+##    unions then run at VRAM speed on the second card - the exact
+##    regime where lucebox's 3.4x lives.
+## 2. acceptance: RING_CAP 256 -> 2048 (matters past 256 ctx), cached
+##    draft ctx-KV ring (lucebox DraftKvCacheRefs) so the window isn't
+##    recomputed per round, try the Q4_K_XL target (less feature noise
+##    than Q3 against a bf16-trained draft).
+## 3. lucebox-style fast rollback (per-position GDN input stash +
+##    replay) to drop the restore+replay forward.
