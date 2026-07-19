@@ -856,7 +856,7 @@ impl Model {
         kernels::rms_norm(&mut st.normed, &st.cur, &l.attn_norm, s.n_embd, t, eps)?;
         kernels::matmul_q8_0(&mut st.q_rank, &w.q_a, &st.normed, s.n_embd, s.n_lora_q, t)?;
         kernels::rms_norm(&mut st.q_rank_norm, &st.q_rank, &w.q_a_norm, s.n_lora_q, t, eps)?;
-        if std::env::var_os("PULSAR_HID_LOG").is_some() && (2030..2053).contains(&(pos0 + t - 1)) {
+        if std::env::var_os("PULSAR_HID_LOG").is_some() && (2030..2066).contains(&(pos0 + t - 1)) {
             kernels::sync()?;
             let rows = st.normed.read_f32(t as usize * s.n_embd as usize)?;
             for i in 0..t as usize {
