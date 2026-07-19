@@ -1791,12 +1791,17 @@ mod real {
     }
 
     /// K-quant tensor -> resident device bytes + the matmul_kq metadata.
+    /// Reads RAW file bytes: read_tensor_bytes would requant K-quants to
+    /// q8_0 (1.9x the VRAM and the wrong layout for matmul_kq).
     fn upload_kq(file: &VFile, g: &Gguf, name: &str) -> Result<KqW> {
         let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
         let quant = quant_code(t.ty)
             .ok_or_else(|| format!("{name}: unsupported K-quant type {:?}", t.ty))?;
+        let bytes = t.byte_size().ok_or_else(|| meta_err(name))?;
+        let mut buf = vec![0u8; bytes as usize];
+        file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
         Ok(KqW {
-            w: upload(file, g, name)?,
+            w: DeviceBuf::from_bytes(&buf)?,
             row_bytes: t.ty.row_bytes(t.dims[0]).unwrap(),
             quant,
         })
@@ -2044,28 +2049,46 @@ mod real {
                     .filter(|&d| d != primary)
                     .max_by_key(|&d| kernels::mem_info(d).map(|(f, _)| f).unwrap_or(0))
                     .unwrap();
+                // VRAM bytes, not file bytes: the loader requants K-quant
+                // matmul_q8_0 tensors to q8_0 (~1.9x for Q4_K); only the
+                // DenseKq ffn triple uploads raw
+                let vram = |t: &TensorInfo| -> u64 {
+                    let raw = t.byte_size().unwrap_or(0);
+                    let kq = matches!(
+                        t.ty,
+                        TensorType::Q2K | TensorType::Q3K | TensorType::Q4K
+                            | TensorType::Q5K | TensorType::Q6K
+                    );
+                    let ffn_raw = t.name.ends_with("ffn_gate.weight")
+                        || t.name.ends_with("ffn_up.weight")
+                        || t.name.ends_with("ffn_down.weight");
+                    if kq && !ffn_raw { t.n_elements() / 32 * 34 } else { raw }
+                };
                 let lbytes: Vec<u64> = (0..shape.n_exec_layer)
                     .map(|il| {
                         let p = format!("blk.{il}.");
                         gguf.tensors
                             .iter()
                             .filter(|t| t.name.starts_with(&p))
-                            .filter_map(|t| t.byte_size())
+                            .map(&vram)
                             .sum()
                     })
                     .collect();
-                let head: u64 = gguf.tensor("output.weight").and_then(|t| t.byte_size()).unwrap_or(0);
+                // resident on the primary regardless of the split: lm head
+                // (native K-quant) + the q8_0 embedding table
+                let fixed: u64 = gguf.tensor("output.weight").and_then(|t| t.byte_size()).unwrap_or(0)
+                    + gguf.tensor("token_embd.weight").map(&vram).unwrap_or(0);
                 // ponytail: fixed 1.5 primary-bandwidth factor (5060 Ti vs
                 // 4060 Ti VRAM bw); probe real bandwidths if a box needs it
                 let bw0 = 1.5f64;
-                let n0 = match std::env::var("PULSAR_SPLIT").ok().and_then(|v| v.parse::<usize>().ok()) {
+                let mut n0 = match std::env::var("PULSAR_SPLIT").ok().and_then(|v| v.parse::<usize>().ok()) {
                     Some(n) => n.min(lbytes.len()),
                     None => {
                         let total: u64 = lbytes.iter().sum();
                         let mut acc = 0u64;
                         let mut best = (f64::MAX, lbytes.len());
                         for n in 0..=lbytes.len() {
-                            let t0 = (head + acc) as f64 / bw0;
+                            let t0 = (fixed + acc) as f64 / bw0;
                             let t1 = (total - acc) as f64;
                             let worst = t0.max(t1);
                             if worst < best.0 {
@@ -2078,6 +2101,14 @@ mod real {
                         best.1
                     }
                 };
+                // capacity clamp: fixed + primary layers + KV/scratch
+                // reserve must fit the primary's free VRAM
+                if let Ok((free, _)) = kernels::mem_info(primary) {
+                    let reserve = 2u64 << 30;
+                    while n0 > 0 && fixed + lbytes[..n0].iter().sum::<u64>() + reserve > free as u64 {
+                        n0 -= 1;
+                    }
+                }
                 for d in layer_dev.iter_mut().skip(n0) {
                     *d = second;
                 }
