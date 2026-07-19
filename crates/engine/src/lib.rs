@@ -276,8 +276,10 @@ mod real {
                 },
                 // deepseek4/qwen35moe have no dense FFN layers and omit the key
                 n_ff_dense: match family {
+                    // note: or_else, not unwrap_or - the eager fallback
+                    // arg would ? on files that only ship the plain key
                     Family::Dsv4 | Family::Qwen35 => u("feed_forward_length")
-                        .unwrap_or(u("expert_feed_forward_length")?),
+                        .or_else(|_| u("expert_feed_forward_length"))?,
                     _ => u("feed_forward_length")?,
                 },
                 n_vocab,
