@@ -733,13 +733,22 @@ impl Model {
                     let key = (t, il);
                     if !graphs.contains_key(&key) {
                         let (lo2, hi2) = (il, end);
+                        // capture takes a kernels::Result closure; stash
+                        // the real engine error across the boundary
+                        let mut inner: Option<Box<dyn std::error::Error>> = None;
                         let g = kernels::Graph::capture(|| {
                             for j in lo2..hi2 {
-                                self.eval_qwen35_layer(st, rt, j, &self.layers[j], pos, t)?;
+                                if let Err(e) = self.eval_qwen35_layer(st, rt, j, &self.layers[j], pos, t) {
+                                    inner = Some(e);
+                                    return Err(kernels::Error("graph capture body failed"));
+                                }
                             }
                             Ok(())
-                        })?;
-                        graphs.insert(key, g);
+                        });
+                        if let Some(e) = inner {
+                            return Err(e);
+                        }
+                        graphs.insert(key, g?);
                     }
                     graphs[&key].launch()?;
                     il = end;
