@@ -2739,22 +2739,22 @@ __global__ static void matmul_kqw_kernel(
 /* Warp-cooperative token-tiled variant: coalesced weight words read
  * ONCE per row serve every token (runtime n_tok <= 16) - MTP/DFlash
  * verify rows were re-reading the full weight matrix per token. */
-template <typename WDOT>
+template <typename WDOT, int TT>
 __global__ static void matmul_kqw_tokens_kernel(
         float *out,
         const char *w,
         const block_q8_K *xq,
         uint32_t in_blocks,
         uint32_t out_dim,
-        uint32_t n_tok,
+        uint32_t n_tok, /* <= TT; TT is the register budget */
         uint64_t row_bytes) {
     const uint32_t lane = threadIdx.x;
     const uint32_t row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= out_dim) return;
     const char *wr = w + (uint64_t)row * row_bytes;
-    float acc[16];
+    float acc[TT];
     #pragma unroll
-    for (int t = 0; t < 16; t++) acc[t] = 0.0f;
+    for (int t = 0; t < TT; t++) acc[t] = 0.0f;
     for (uint32_t b = 0; b < in_blocks; b++) {
         for (uint32_t t = 0; t < n_tok; t++) {
             /* weight loads inside WDOT::block CSE across the token loop */
@@ -2826,19 +2826,29 @@ extern "C" int pulsar_matmul_kq(
      * dots for any 2..16 rows */
     if (n_tok >= 2u && n_tok <= 16u) {
         dim3 tgrid((out_dim + 3u) / 4u, 1, 1);
+        /* smallest register-budget tile that fits n_tok */
+        #define PULSAR_KQW_T(WDOT)                                             \
+            do {                                                               \
+                if (n_tok <= 4u)                                               \
+                    matmul_kqw_tokens_kernel<WDOT, 4><<<tgrid, block>>>(       \
+                            (float *)out_dev, (const char *)w_dev,             \
+                            (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes); \
+                else if (n_tok <= 8u)                                          \
+                    matmul_kqw_tokens_kernel<WDOT, 8><<<tgrid, block>>>(       \
+                            (float *)out_dev, (const char *)w_dev,             \
+                            (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes); \
+                else                                                           \
+                    matmul_kqw_tokens_kernel<WDOT, 16><<<tgrid, block>>>(      \
+                            (float *)out_dev, (const char *)w_dev,             \
+                            (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes); \
+                return cuda_ok(cudaGetLastError(), "matmul_kqw_tokens launch"); \
+            } while (0)
         switch (quant) {
-        case PULSAR_QUANT_Q4_K:
-            matmul_kqw_tokens_kernel<wdot_q4_K><<<tgrid, block>>>(
-                    (float *)out_dev, (const char *)w_dev,
-                    (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
-            return cuda_ok(cudaGetLastError(), "matmul_kqw_tokens launch");
-        case PULSAR_QUANT_Q6_K:
-            matmul_kqw_tokens_kernel<wdot_q6_K><<<tgrid, block>>>(
-                    (float *)out_dev, (const char *)w_dev,
-                    (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
-            return cuda_ok(cudaGetLastError(), "matmul_kqw_tokens launch");
+        case PULSAR_QUANT_Q4_K: PULSAR_KQW_T(wdot_q4_K);
+        case PULSAR_QUANT_Q6_K: PULSAR_KQW_T(wdot_q6_K);
         default: break;
         }
+        #undef PULSAR_KQW_T
     }
     /* verify/draft-sized batches take the token-tiled kernel: one row
      * read serves all 16 tokens (identical math, per-token order) */
