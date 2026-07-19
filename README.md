@@ -40,11 +40,11 @@ Gen5 NVMe.
 | Gemma 4 26B-A4B | 26B | 4B | 16GB (Q4_K_XL) | **41 tok/s** | – |
 | Qwen3.6-35B-A3B | 35B | 3B (top-8 of 256 + shared) | 22GB (Q4_K_XL) | **51.8 tok/s** | – |
 | ThinkingCap-Qwen3.6-27B (dense) | 27B | 27B | 16GB (Q4_K_M) | **18.3 tok/s** (27.5 w/ nextn MTP) | – |
-| DeepSeek-V4-Flash | 284B | ~8B (top-6 of 256 + shared) | 87GB (ds4 recipe) | **8.0 tok/s** (11.4 w/ CPU lane) | – |
-| Hy3 295B | 295B | 21B (top-8 of 192) | 79GB (IQ2_XXS) | **5.3 tok/s** (7.0 w/ CPU lane) | 0.64–0.70 |
+| DeepSeek-V4-Flash | 284B | ~8B (top-6 of 256 + shared) | 87GB (ds4 recipe) | **8.0 tok/s** (11.3 w/ CPU lane) | – |
+| Hy3 295B | 295B | 21B (top-8 of 192) | 79GB (IQ2_XXS) | **6.0 tok/s** (6.9 w/ CPU lane) | 0.64–0.70 |
 | Qwen3-235B-A22B | 235B | 22B (top-8 of 128) | 83GB (Q2_K_XL) | **5.3 tok/s** (6.4 w/ CPU lane) | – |
 | MiniMax M3 | 428B | 23B | 134GB (Q2_K_XL) | **4.5 tok/s** (4.9 w/ CPU lane) | – |
-| GLM-5.2 | 744B | 40B | 211GB (ds4 recipe) | **1.7 tok/s** (1.9–2.8 w/ CPU lane) | 0.40 |
+| GLM-5.2 | 744B | 40B | 211GB (ds4 recipe) | **1.7 tok/s** (2.4 w/ CPU lane) | 0.40 |
 | TML Inkling | 975B | 41B (6 + 2 shared) | 296GB (Q2_K_XL) | **1.6 tok/s** (1.75 w/ CPU lane) | – |
 | Kimi K2.7 Code† | ~1T | 32B | 339GB (Q2_K_XL) | **1.3 tok/s** | – |
 
@@ -100,10 +100,13 @@ x q8_K kernels sustain 42 GB/s across the 9900X's cores, above the
 28.7 GB/s the same bytes would cost crossing PCIe, and the dots
 overlap the GPU resolve. Host-cached experts stop competing for
 upload bandwidth and VRAM cache slots, so both effects compound:
-DeepSeek-V4-Flash measures 8.1 to 11.4 tok/s (+41%), Hy3 5.0 to 7.0
-(+40%), GLM-5.2 1.6 to 2.8 on good runs. GLM's exact gain varies run
-to run with how the cache ecology settles (the floor stays at
-baseline). Covers iq2_xxs, iq2_xs, iq3_xxs, q2_K, q3_K and q4_K
+DeepSeek-V4-Flash measures 8.0 to 11.3 tok/s, Hy3 6.0 to 6.9, GLM-5.2
+1.7 to 2.4 (re-measured 2026-07-19 after an iq2_xxs correctness fix:
+the CPU dot had been indexing the encoder-unit grid instead of the
+dequant lattice, scaling every lane partial by ~1/9 per dot - GLM
+surfaced it as repetition loops, and a one-row GPU-vs-CPU arbiter now
+pins the dot to the kernel bit-for-bit-scale; earlier lane numbers
+were measured with the broken dot and are superseded by these). Covers iq2_xxs, iq2_xs, iq3_xxs, q2_K, q3_K and q4_K
 expert tensors, which spans the ds4 recipes and the UD-Q2_K_XL mixes:
 Qwen3-235B 5.3 to 6.4 (+21%), TML Inkling 1.63 to 1.75 (+7%),
 MiniMax M3 4.7 to 4.9 (its IQ mix engages on 54 of 57 MoE layers; the
