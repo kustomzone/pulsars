@@ -1748,6 +1748,67 @@ struct dot_q4_K {
     }
 };
 
+/* Warp-cooperative K-quant dots: the whole warp walks each block
+ * together, lanes on consecutive 4-byte quant words - coalesced loads
+ * and zero idle lanes even on short rows (a 5120-wide row is only 20
+ * blocks; the lane-per-block layout left 12 of 32 lanes idle and
+ * strided the loads 144B apart). Returns this lane's float partial;
+ * the caller warp-reduces once per row. */
+
+struct wdot_q4_K {
+    __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b, uint32_t lane) {
+        const block_q4_K *x = (const block_q4_K *)row + b;
+        const block_q8_K *y = xq + b;
+        const float d = f16_to_f32(x->d) * y->d;
+        const float dmin = f16_to_f32(x->dmin) * y->d;
+        /* qs = 32 words; lane w -> chunk j = w/8 (64 values), word w%8.
+         * low nibbles pair with q8[j*64 + 4*(w%8)], high with +32. */
+        const uint32_t j = lane >> 3, wi = (lane & 7u) << 2;
+        const uint32_t v = *(const uint32_t *)(x->qs + 32 * j + wi);
+        const int8_t *q8 = y->qs + 64 * j;
+        uint8_t sc1, m1, sc2, m2;
+        k4_scale_min(2 * j, x->scales, &sc1, &m1);
+        k4_scale_min(2 * j + 1, x->scales, &sc2, &m2);
+        const int s1 = __dp4a((int)(v & 0x0f0f0f0fu), *(const int32_t *)(q8 + wi), 0);
+        const int s2 = __dp4a((int)((v >> 4) & 0x0f0f0f0fu), *(const int32_t *)(q8 + 32 + wi), 0);
+        float acc = d * (float)((int)sc1 * s1 + (int)sc2 * s2);
+        if ((lane & 7u) == 0) {
+            /* one lane per chunk carries the min term */
+            acc -= dmin * (float)((int)m1 * (y->bsums[4 * j] + y->bsums[4 * j + 1]) +
+                                  (int)m2 * (y->bsums[4 * j + 2] + y->bsums[4 * j + 3]));
+        }
+        return acc;
+    }
+};
+
+struct wdot_q6_K {
+    __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b, uint32_t lane) {
+        const block_q6_K *x = (const block_q6_K *)row + b;
+        const block_q8_K *y = xq + b;
+        const float d = f16_to_f32(x->d) * y->d;
+        /* lane -> (chunk j of 128 values, i in {0,4..28}, low/high pair) */
+        const uint32_t j = lane >> 4, i = (lane & 7u) << 2, hi = (lane >> 3) & 1u;
+        const uint8_t *ql = x->ql + 64 * j;
+        const uint32_t h = *(const uint32_t *)(x->qh + 32 * j + i);
+        const int8_t *q8 = y->qs + 128 * j + 64 * hi;
+        const int8_t *sc = x->scales + 8 * j + 4 * hi;
+        const uint32_t lo0 = *(const uint32_t *)(ql + i);
+        const uint32_t lo1 = *(const uint32_t *)(ql + 32 + i);
+        const uint32_t sub = i >> 4;
+        int32_t va, vb;
+        if (hi == 0) {
+            va = __vsub4((int)((lo0 & 0x0f0f0f0fu) | (((h >> 0) & 0x03030303u) << 4)), 0x20202020);
+            vb = __vsub4((int)((lo1 & 0x0f0f0f0fu) | (((h >> 2) & 0x03030303u) << 4)), 0x20202020);
+        } else {
+            va = __vsub4((int)(((lo0 >> 4) & 0x0f0f0f0fu) | (((h >> 4) & 0x03030303u) << 4)), 0x20202020);
+            vb = __vsub4((int)(((lo1 >> 4) & 0x0f0f0f0fu) | (((h >> 6) & 0x03030303u) << 4)), 0x20202020);
+        }
+        const int sa = __dp4a(va, *(const int32_t *)(q8 + i), 0);
+        const int sb = __dp4a(vb, *(const int32_t *)(q8 + 32 + i), 0);
+        return d * (float)((int)sc[0 + sub] * sa + (int)sc[2 + sub] * sb);
+    }
+};
+
 struct dot_q5_K {
     __device__ __forceinline__ static float block(const char *row, const block_q8_K *xq, uint32_t b) {
         return dev_dot_q5_K_q8_K_block((const block_q5_K *)row + b, xq + b);
@@ -2644,6 +2705,35 @@ __global__ static void matmul_kq_kernel(
     if (lane == 0) out[(uint64_t)token * out_dim + row] = acc;
 }
 
+/* Warp-cooperative variant (wdot_*): the warp walks blocks together,
+ * lanes on consecutive quant words - the dense-FFN decode path (squat
+ * 5120-wide rows starved the lane-per-block layout above). */
+template <typename WDOT>
+__global__ static void matmul_kqw_kernel(
+        float *out,
+        const char *w,
+        const block_q8_K *xq,
+        uint32_t in_blocks,
+        uint32_t out_dim,
+        uint32_t n_tok,
+        uint64_t row_bytes) {
+    const uint32_t lane = threadIdx.x;
+    const uint32_t row = blockIdx.x * blockDim.y + threadIdx.y;
+    const uint32_t token = blockIdx.y;
+    if (row >= out_dim || token >= n_tok) return;
+    const char *wr = w + (uint64_t)row * row_bytes;
+    const block_q8_K *txq = xq + (uint64_t)token * in_blocks;
+    float acc = 0.0f;
+    for (uint32_t b = 0; b < in_blocks; b++) {
+        acc += WDOT::block(wr, txq, b, lane);
+    }
+    #pragma unroll
+    for (uint32_t mask = 16u; mask > 0u; mask >>= 1u) {
+        acc += __shfl_xor_sync(0xffffffffu, acc, mask);
+    }
+    if (lane == 0) out[(uint64_t)token * out_dim + row] = acc;
+}
+
 /* Token-tiled variant: one warp owns a row for ALL TT tokens, so the
  * row bytes are read once (L1-hot across the register token loop)
  * instead of once per token - on a 248k-row lm head the legacy grid
@@ -2724,13 +2814,13 @@ extern "C" int pulsar_matmul_kq(
         matmul_kq_kernel<dot_iq2_xxs><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
         break;
     case PULSAR_QUANT_Q4_K:
-        matmul_kq_kernel<dot_q4_K><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+        matmul_kqw_kernel<wdot_q4_K><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
         break;
     case PULSAR_QUANT_Q5_K:
         matmul_kq_kernel<dot_q5_K><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
         break;
     case PULSAR_QUANT_Q6_K:
-        matmul_kq_kernel<dot_q6_K><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
+        matmul_kqw_kernel<wdot_q6_K><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
         break;
     case PULSAR_QUANT_Q3_K:
         matmul_kq_kernel<dot_q3_K><<<grid, block>>>((float *)out_dev, (const char *)w_dev, (const block_q8_K *)xq_dev, in_blocks, out_dim, n_tok, row_bytes);
