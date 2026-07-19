@@ -881,10 +881,23 @@ impl Model {
             }
         }
         kernels::matmul_q8_0(&mut st.q, &w.q_b, &st.q_rank_norm, s.n_lora_q, q_dim, t)?;
+        let qprobe = std::env::var_os("PULSAR_L0_LOG").is_some() && il == 0 && (2046..2051).contains(&pos0);
+        if qprobe {
+            kernels::sync()?;
+            eprintln!("qstage L{il} @{pos0} t={t} rank={:x} post_qb={:x}", l0_hash(&st.q_rank_norm, s.n_lora_q as usize), l0_hash(&st.q, q_dim as usize));
+        }
         kernels::gqa_head_rms_norm(&mut st.q, None, t * s.n_head, s.head_dim, eps)?;
+        if qprobe {
+            kernels::sync()?;
+            eprintln!("qstage L{il} @{pos0} post_rms={:x}", l0_hash(&st.q, q_dim as usize));
+        }
         kernels::matmul_q8_0(&mut st.k, &w.kv, &st.normed, s.n_embd, s.head_dim, t)?;
         kernels::rms_norm(&mut st.v, &st.k, &w.kv_a_norm, s.head_dim, t, eps)?;
         kernels::dsv4_rope_tail(&mut st.q, t, s.n_head, s.head_dim, s.rot_dim, pos0, &rope, false)?;
+        if qprobe {
+            kernels::sync()?;
+            eprintln!("qstage L{il} @{pos0} post_rope={:x}", l0_hash(&st.q, q_dim as usize));
+        }
         kernels::dsv4_rope_tail(&mut st.v, t, 1, s.head_dim, s.rot_dim, pos0, &rope, false)?;
         kernels::dsv4_fp8_sim(&mut st.v, t, s.head_dim, s.rot_dim)?;
         kernels::dsv4_f16_round(&mut st.v, t * s.head_dim)?;
