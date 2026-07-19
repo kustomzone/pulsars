@@ -884,7 +884,14 @@ impl Model {
         let qprobe = std::env::var_os("PULSAR_L0_LOG").is_some() && il == 0 && (2046..2051).contains(&pos0);
         if qprobe {
             kernels::sync()?;
-            eprintln!("qstage L{il} @{pos0} t={t} rank={:x} post_qb={:x}", l0_hash(&st.q_rank_norm, s.n_lora_q as usize), l0_hash(&st.q, q_dim as usize));
+            eprintln!(
+                "qstage L{il} @{pos0} t={t} cur={:x} normed={:x} qrank={:x} rank={:x} post_qb={:x}",
+                l0_hash(&st.cur, s.n_embd as usize),
+                l0_hash(&st.normed, s.n_embd as usize),
+                l0_hash(&st.q_rank, s.n_lora_q as usize),
+                l0_hash(&st.q_rank_norm, s.n_lora_q as usize),
+                l0_hash(&st.q, q_dim as usize)
+            );
         }
         kernels::gqa_head_rms_norm(&mut st.q, None, t * s.n_head, s.head_dim, eps)?;
         if qprobe {
