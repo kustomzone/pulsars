@@ -1568,6 +1568,21 @@ mod real {
                     .collect();
                 let npairs: usize = self.pairs.iter().map(|p| p.len()).sum();
                 self.mids = vec![0f32; npairs * self.nf];
+                if std::env::var_os("PULSAR_LANE_DBG").is_some() {
+                    for (ci, pairs) in self.pairs.iter().enumerate() {
+                        let [gp, up_, _] = self.ptrs[ci];
+                        let g_row = unsafe { std::slice::from_raw_parts(gp.get(), self.grb) };
+                        let u_row = unsafe { std::slice::from_raw_parts(up_.get(), self.grb) };
+                        let g = dot(self.gq, g_row, &self.xqs[0], self.ne);
+                        let u = dot(self.gq, u_row, &self.xqs[0], self.ne);
+                        eprintln!(
+                            "lane dbg ci={ci} gq={} act={} g={g:.5} u={u:.5} w={:.5} mid0={:.6}",
+                            self.gq, self.act_op,
+                            pairs.first().map(|p| p.1).unwrap_or(0.0),
+                            glu(g, u, self.act_op) * pairs.first().map(|p| p.1).unwrap_or(0.0)
+                        );
+                    }
+                }
                 let (nf, grb, gq, act_op) = (self.nf, self.grb, self.gq, self.act_op);
                 let xq_ptr = SendPtr(self.xqs.as_ptr() as *const u8);
                 let mut jobs: Vec<Job> = Vec::new();
