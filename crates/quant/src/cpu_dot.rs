@@ -9,7 +9,6 @@
 //! nibble; value = grid_byte(2l+1 units) * sign, block factor
 //! (2*scale+1), whole-block factor 0.125 * d_x * d_y.
 
-use crate::iq::tables;
 
 pub const QK_K: usize = 256;
 /// iq2_xxs: 2 bytes f16 d + 16 u32 per 256 values
@@ -93,7 +92,7 @@ pub fn vec_dot_iq2_xxs_q8_k(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
 /// Scalar reference/fallback.
 pub fn vec_dot_iq2_xxs_q8_k_scalar(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
     debug_assert_eq!(n % QK_K, 0);
-    let t = tables();
+    let grid = &crate::cpu_dot_tables::IQ2XXS_GRID;
     let nb = n / QK_K;
     debug_assert!(row.len() >= nb * IQ2_XXS_BLOCK_BYTES);
     let mut total = 0f32;
@@ -108,7 +107,7 @@ pub fn vec_dot_iq2_xxs_q8_k_scalar(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
             let ls = (2 * (aux1 >> 28) + 1) as i32;
             let mut sumi = 0i32;
             for k in 0..4 {
-                let g = t.grid[((aux0 >> (8 * k)) & 0xff) as usize].to_le_bytes();
+                let g = grid[((aux0 >> (8 * k)) & 0xff) as usize].to_le_bytes();
                 let sm = sign_mask((aux1 >> (7 * k)) & 127);
                 let q8k = &q8[ib32 * 32 + 8 * k..ib32 * 32 + 8 * k + 8];
                 for i in 0..8 {
@@ -658,7 +657,7 @@ mod avx2 {
 
     #[target_feature(enable = "avx2")]
     pub unsafe fn vec_dot(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
-        let t = tables();
+        let grid_t = &crate::cpu_dot_tables::IQ2XXS_GRID;
         let nb = n / QK_K;
         debug_assert!(row.len() >= nb * IQ2_XXS_BLOCK_BYTES);
         let ones = _mm256_set1_epi16(1);
@@ -674,10 +673,10 @@ mod avx2 {
                 let aux1 = (p.add(4) as *const u32).read_unaligned();
                 let ls = (2 * (aux1 >> 28) + 1) as i32;
                 let grid = _mm256_set_epi64x(
-                    t.grid[((aux0 >> 24) & 0xff) as usize] as i64,
-                    t.grid[((aux0 >> 16) & 0xff) as usize] as i64,
-                    t.grid[((aux0 >> 8) & 0xff) as usize] as i64,
-                    t.grid[(aux0 & 0xff) as usize] as i64,
+                    grid_t[((aux0 >> 24) & 0xff) as usize] as i64,
+                    grid_t[((aux0 >> 16) & 0xff) as usize] as i64,
+                    grid_t[((aux0 >> 8) & 0xff) as usize] as i64,
+                    grid_t[(aux0 & 0xff) as usize] as i64,
                 );
                 let signs = _mm256_set_epi64x(
                     KSIGNS64[((aux1 >> 21) & 127) as usize] as i64,
@@ -754,7 +753,7 @@ pub fn vec_dot_q2_k_q8_k_scalar(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
 
 /// Scalar dequant of an iq2_xxs row to f32 (unit-test reference only).
 pub fn dequant_row_iq2_xxs(row: &[u8], n: usize, out: &mut Vec<f32>) {
-    let t = tables();
+    let grid = &crate::cpu_dot_tables::IQ2XXS_GRID;
     out.clear();
     for ibl in 0..n / QK_K {
         let blk = &row[ibl * IQ2_XXS_BLOCK_BYTES..(ibl + 1) * IQ2_XXS_BLOCK_BYTES];
@@ -764,7 +763,7 @@ pub fn dequant_row_iq2_xxs(row: &[u8], n: usize, out: &mut Vec<f32>) {
             let aux1 = u32::from_le_bytes([blk[6 + 8 * ib32], blk[7 + 8 * ib32], blk[8 + 8 * ib32], blk[9 + 8 * ib32]]);
             let db = 0.125 * xd * (2 * (aux1 >> 28) + 1) as f32;
             for k in 0..4 {
-                let g = t.grid[((aux0 >> (8 * k)) & 0xff) as usize].to_le_bytes();
+                let g = grid[((aux0 >> (8 * k)) & 0xff) as usize].to_le_bytes();
                 let sm = sign_mask((aux1 >> (7 * k)) & 127);
                 for i in 0..8 {
                     let v = db * g[i] as i8 as f32;
