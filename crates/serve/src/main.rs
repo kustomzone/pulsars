@@ -288,9 +288,13 @@ fn handle_chat(
         // (a comment between events is legal, clients ignore it).
         let ka_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ka_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // set when a keepalive write fails = the client is gone; the
+        // generate loop polls it and abandons the work
+        let ka_dead = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ka_thread = {
             let started = ka_started.clone();
             let stop = ka_stop.clone();
+            let dead = ka_dead.clone();
             let mut ks = stream.try_clone()?;
             std::thread::spawn(move || {
                 use std::sync::atomic::Ordering;
@@ -302,6 +306,7 @@ fn handle_chat(
                         }
                     }
                     if ks.write_all(b": prefill keepalive\n\n").and_then(|_| ks.flush()).is_err() {
+                        dead.store(true, Ordering::Relaxed);
                         return;
                     }
                 }
@@ -309,8 +314,8 @@ fn handle_chat(
         };
         let mut bytes: Vec<u8> = Vec::new();
         let mut n_out = 0usize;
-        let mut send_err = None;
-        engine::generate(
+        let send_err = std::cell::Cell::new(false);
+        engine::generate_cancellable(
             model,
             st,
             &prompt[common..],
@@ -333,7 +338,7 @@ fn handle_chat(
                     Ok(s) => s.len(),
                     Err(e) => e.valid_up_to(),
                 };
-                if valid > 0 && send_err.is_none() {
+                if valid > 0 && !send_err.get() {
                     let text = String::from_utf8_lossy(&bytes[..valid]).into_owned();
                     bytes.drain(..valid);
                     let chunk = serde_json::json!({
@@ -341,9 +346,12 @@ fn handle_chat(
                         "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": null}],
                     });
                     if write!(stream, "data: {chunk}\n\n").and_then(|_| stream.flush()).is_err() {
-                        send_err = Some(());
+                        send_err.set(true);
                     }
                 }
+            },
+            || {
+                ka_dead.load(std::sync::atomic::Ordering::Relaxed) || send_err.get()
             },
         )?;
         let fin = serde_json::json!({
