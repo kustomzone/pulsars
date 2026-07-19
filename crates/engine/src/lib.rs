@@ -819,6 +819,12 @@ mod real {
     pub struct Prof {
         pub sync: std::time::Duration,
         pub resolve: std::time::Duration,
+        /// D2H of router_selected / pred_selected inside resolve
+        pub resolve_d2h: std::time::Duration,
+        /// distinct/offsets/wants/tier placement list building
+        pub resolve_lists: std::time::Duration,
+        /// host LFU ensure_with wall minus nested h2d (disk wait + cache hits)
+        pub resolve_host: std::time::Duration,
         pub h2d: std::time::Duration,
         /// CPU expert lane wall time after the stage-A overlap (mid
         /// quantize + down-proj fan-out + join)
@@ -830,12 +836,17 @@ mod real {
     impl Prof {
         pub fn report(&self) -> String {
             let s = |d: std::time::Duration| d.as_secs_f64();
+            let accounted = self.resolve_d2h + self.resolve_lists + self.resolve_host + self.h2d;
+            let other = self.resolve.saturating_sub(accounted);
             format!(
-                "gpu-wait {:.2}s, resolve {:.2}s (h2d {:.2}s, disk/host {:.2}s), cpu-lane {:.2}s, logits-tail {:.2}s over {} layer steps",
+                "gpu-wait {:.2}s, resolve {:.2}s (d2h {:.2}s, lists {:.2}s, host {:.2}s, h2d {:.2}s, other {:.2}s), cpu-lane {:.2}s, logits-tail {:.2}s over {} layer steps",
                 s(self.sync),
                 s(self.resolve),
+                s(self.resolve_d2h),
+                s(self.resolve_lists),
+                s(self.resolve_host),
                 s(self.h2d),
-                s(self.resolve) - s(self.h2d),
+                s(other),
                 s(self.cpu),
                 s(self.tail),
                 self.calls
@@ -995,14 +1006,24 @@ mod real {
     /// requested offset gets a global touch count, and a slab is admitted
     /// only when it is strictly hotter than the coldest resident. Cold
     /// slabs stream through the staging arena and never enter the pool.
+    ///
+    /// Gate/up/down triples that enter via `maybe_insert_triple` or warm
+    /// load share a `group` id so eviction frees the whole triple (avoids
+    /// half-resident experts that still force H2D of siblings).
     pub struct DeviceSlabCache {
         pool: DeviceBuf,
         slab_bytes: usize,
         map: std::collections::HashMap<u64, u32>,
-        /// per slot: (touch count at admission, offset); u64::MAX = free
-        meta: Vec<(u64, u64)>,
+        /// per slot: (touch count at admission, offset, group); offset
+        /// u64::MAX = free; group u32::MAX = ungrouped singleton
+        meta: Vec<(u64, u64, u32)>,
+        /// free slot indices (O(1) take; rebuild not required)
+        free_list: Vec<u32>,
+        /// occupied slots with group == u32::MAX (singleton admits only)
+        ungrouped: u32,
         /// global (touch count, slab len) per requested offset, cached or not
         touch: std::collections::HashMap<u64, (u64, u64)>,
+        next_group: u32,
         pub hits: u64,
         pub misses: u64,
     }
@@ -1014,8 +1035,11 @@ mod real {
                 pool: DeviceBuf::alloc(slots * slab_bytes + SLAB_SLACK)?,
                 slab_bytes,
                 map: std::collections::HashMap::with_capacity(slots),
-                meta: vec![(0, u64::MAX); slots],
+                meta: vec![(0, u64::MAX, u32::MAX); slots],
+                free_list: (0..slots as u32).collect(),
+                ungrouped: 0,
                 touch: std::collections::HashMap::new(),
+                next_group: 1,
                 hits: 0,
                 misses: 0,
             })
@@ -1023,6 +1047,40 @@ mod real {
 
         fn slot_ptr(&self, slot: u32) -> *const std::ffi::c_void {
             self.pool.ptr_at(slot as usize * self.slab_bytes)
+        }
+
+        fn free_slot(&mut self, slot: u32) {
+            let off = self.meta[slot as usize].1;
+            if off == u64::MAX {
+                return; // already free
+            }
+            let g = self.meta[slot as usize].2;
+            if g == u32::MAX {
+                self.ungrouped = self.ungrouped.saturating_sub(1);
+            }
+            self.map.remove(&off);
+            self.meta[slot as usize] = (0, u64::MAX, u32::MAX);
+            self.free_list.push(slot);
+        }
+
+        /// Free `slot` and every other slot sharing its group (whole triple).
+        /// Only for triple-unit admit/evict — never for single-slab runtime admits.
+        fn free_group_of(&mut self, slot: u32) {
+            let g = self.meta[slot as usize].2;
+            if g == u32::MAX {
+                self.free_slot(slot);
+                return;
+            }
+            let members: Vec<u32> = self
+                .meta
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.2 == g)
+                .map(|(i, _)| i as u32)
+                .collect();
+            for s in members {
+                self.free_slot(s);
+            }
         }
 
         fn get(&mut self, offset: u64, len: u64) -> Option<*const std::ffi::c_void> {
@@ -1042,44 +1100,133 @@ mod real {
             }
         }
 
-        /// Admit `payload` if it is hotter than the coldest resident (or a
-        /// slot is free). Returns None when the slab is not worthy - the
-        /// caller streams it through staging instead. `in_use` offsets are
-        /// never evicted.
+        /// Peek without bumping touch / hit counters (prefetch staging).
+        fn peek(&self, offset: u64) -> Option<*const std::ffi::c_void> {
+            self.map.get(&offset).map(|&slot| self.slot_ptr(slot))
+        }
+
+        /// Admit `payload` if it is hotter than the coldest *ungrouped*
+        /// resident (or a free slot exists). Returns None when the slab is
+        /// not worthy - the caller streams it through staging instead.
+        ///
+        /// Critical: never evict a warm-loaded triple member for a singleton
+        /// admit. Breaking triples filled VRAM with incomplete experts and
+        /// collapsed slab hit rate 72% -> 53% (measured). Triple groups are
+        /// only replaced by `maybe_insert_triple`.
+        ///
+        /// After warm fill the pool is usually all triples: free_list empty
+        /// and ungrouped==0 → O(1) early-out (stage path).
         fn maybe_insert(
             &mut self,
             offset: u64,
             payload: &[u8],
             in_use: &[u64],
         ) -> Result<Option<*const std::ffi::c_void>> {
+            if let Some(slot) = self.map.get(&offset).copied() {
+                return Ok(Some(self.slot_ptr(slot)));
+            }
+            // O(1): nothing singleton-admittable left (warm pool is all triples)
+            if self.free_list.is_empty() && self.ungrouped == 0 {
+                return Ok(None);
+            }
             let freq = self.touch.get(&offset).map(|t| t.0).unwrap_or(0);
-            let slot = match self.meta.iter().position(|m| m.1 == u64::MAX) {
-                Some(free) => free as u32,
-                None => {
-                    // ponytail: O(slots) coldest-scan; heap it if slots explode
-                    let Some((victim, vmeta)) = self
-                        .meta
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, m)| m.1 != u64::MAX && !in_use.contains(&m.1))
-                        .min_by_key(|(_, m)| m.0)
-                    else {
-                        return Ok(None);
-                    };
-                    if vmeta.0 >= freq {
-                        return Ok(None); // resident is at least as hot
-                    }
-                    let evict_off = vmeta.1;
-                    let victim = victim as u32;
-                    self.map.remove(&evict_off);
-                    victim
+            let slot = if let Some(free) = self.free_list.pop() {
+                free
+            } else {
+                // only steal UNGROUPED slots (group == u32::MAX)
+                let Some((victim, vmeta)) = self
+                    .meta
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| {
+                        m.1 != u64::MAX && m.2 == u32::MAX && !in_use.contains(&m.1)
+                    })
+                    .min_by_key(|(_, m)| m.0)
+                else {
+                    return Ok(None);
+                };
+                if vmeta.0 >= freq {
+                    return Ok(None);
                 }
+                let victim = victim as u32;
+                self.free_slot(victim); // pushes victim onto free_list
+                self.free_list.pop().ok_or("free_list empty after free_slot")?
             };
+            debug_assert_eq!(self.meta[slot as usize].1, u64::MAX);
             let base = slot as usize * self.slab_bytes;
             self.pool.write(base, payload)?;
-            self.meta[slot as usize] = (freq, offset);
+            self.meta[slot as usize] = (freq, offset, u32::MAX);
+            self.ungrouped += 1;
             self.map.insert(offset, slot);
             Ok(Some(self.slot_ptr(slot)))
+        }
+
+        /// Admit gate+up+down as one unit (all-or-nothing). Heat is the sum
+        /// of per-slab touch counts; eviction picks the coldest freeable
+        /// *groups* (or singletons) until three slots are free.
+        fn maybe_insert_triple(
+            &mut self,
+            parts: &[(u64, &[u8]); 3],
+            in_use: &[u64],
+        ) -> Result<Option<[*const std::ffi::c_void; 3]>> {
+            let mut ptrs = [std::ptr::null(); 3];
+            let mut need: Vec<(usize, u64, &[u8])> = Vec::new();
+            for (i, &(off, payload)) in parts.iter().enumerate() {
+                if let Some(p) = self.map.get(&off).map(|&s| self.slot_ptr(s)) {
+                    ptrs[i] = p;
+                } else {
+                    need.push((i, off, payload));
+                }
+            }
+            if need.is_empty() {
+                return Ok(Some(ptrs));
+            }
+            let heat: u64 = parts
+                .iter()
+                .map(|(off, _)| self.touch.get(off).map(|t| t.0).unwrap_or(0))
+                .sum();
+            // free slots already available
+            while self.free_list.len() < need.len() {
+                let mut cands: Vec<(u32, u64, u32)> = self
+                    .meta
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| m.1 != u64::MAX && !in_use.contains(&m.1))
+                    .map(|(i, m)| (i as u32, m.0, m.2))
+                    .collect();
+                if cands.is_empty() {
+                    return Ok(None);
+                }
+                cands.sort_by_key(|c| c.1);
+                let (victim, vfreq, _) = cands[0];
+                let g = self.meta[victim as usize].2;
+                let group_heat: u64 = if g == u32::MAX {
+                    vfreq
+                } else {
+                    self.meta
+                        .iter()
+                        .filter(|m| m.2 == g)
+                        .map(|m| m.0)
+                        .sum()
+                };
+                if group_heat >= heat {
+                    return Ok(None);
+                }
+                self.free_group_of(victim);
+            }
+            let gid = self.next_group;
+            self.next_group = self.next_group.wrapping_add(1).max(1);
+            for (j, (i, off, payload)) in need.iter().enumerate() {
+                let slot = self.free_list.pop().ok_or("triple admit: free_list empty")?;
+                let base = slot as usize * self.slab_bytes;
+                self.pool.write(base, payload)?;
+                let freq = self.touch.get(off).map(|t| t.0).unwrap_or(0);
+                debug_assert_eq!(self.meta[slot as usize].1, u64::MAX);
+                self.meta[slot as usize] = (freq, *off, gid);
+                self.map.insert(*off, slot);
+                ptrs[*i] = self.slot_ptr(slot);
+            }
+            Ok(Some(ptrs))
         }
     }
 
@@ -1148,17 +1295,25 @@ mod real {
             if missing.is_empty() {
                 return Ok(());
             }
-            // evict lowest (freq, tick) not wanted right now
-            // ponytail: O(n) scan per eviction; heap it if the cache ever
-            // holds >100k entries
+            // Evict lowest (freq, tick) among a strided SAMPLE of eligible
+            // entries. Full min scans over ~40k host slabs burned seconds
+            // into resolve "disk/host"; take(64) alone was iteration-order
+            // biased and thrashy.
             let incoming: usize = missing.iter().map(|r| r.len as usize).sum();
+            const EVICT_SAMPLE: usize = 64;
             while self.used + incoming > self.budget && !self.cache.is_empty() {
+                let n = self.cache.len().max(1);
+                let step = (n / EVICT_SAMPLE).max(1);
                 let victim = self
                     .cache
                     .iter()
                     .filter(|(k, _)| {
                         !wants.iter().any(|w| w.offset == **k) && !self.pinned.contains(k)
                     })
+                    .enumerate()
+                    .filter(|(i, _)| i % step == 0)
+                    .map(|(_, kv)| kv)
+                    .take(EVICT_SAMPLE)
                     .min_by_key(|(_, e)| (e.freq, e.tick))
                     .map(|(k, _)| *k);
                 let Some(k) = victim else { break };
@@ -1218,17 +1373,29 @@ mod real {
             self.cache.contains_key(&offset)
         }
 
+        /// Borrow a host-cache slab payload (pinned when fetch used CUDA host alloc).
+        fn payload(&self, offset: u64) -> Option<&[u8]> {
+            self.cache.get(&offset).map(|e| e.slab.payload())
+        }
+
         /// Take ownership of a prefetched slab (evicting to budget).
         fn absorb(&mut self, offset: u64, slab: stream::fetch::Slab) {
             if self.cache.contains_key(&offset) {
                 return;
             }
             let incoming = slab.bytes();
+            const EVICT_SAMPLE: usize = 64;
             while self.used + incoming > self.budget && !self.cache.is_empty() {
+                let n = self.cache.len().max(1);
+                let step = (n / EVICT_SAMPLE).max(1);
                 let victim = self
                     .cache
                     .iter()
                     .filter(|(k, _)| !self.pinned.contains(k))
+                    .enumerate()
+                    .filter(|(i, _)| i % step == 0)
+                    .map(|(_, kv)| kv)
+                    .take(EVICT_SAMPLE)
                     .min_by_key(|(_, e)| (e.freq, e.tick))
                     .map(|(k, _)| *k);
                 let Some(k) = victim else { break };
@@ -2978,7 +3145,16 @@ mod real {
         /// save_warm can merge on this-run deltas (seeded counts otherwise
         /// ratchet: seed + delta > seed every run, a running sum in disguise)
         warm_seeds: std::collections::HashMap<u64, u64>,
+        /// Primary staging arena for expert H2D (parity 0).
         staging: DeviceBuf,
+        /// Alternate staging arena for cross-layer async H2D prefetch (parity 1).
+        staging_alt: DeviceBuf,
+        /// Side stream for expert H2D (overlaps disk / can pipeline with kernels).
+        expert_h2d: kernels::CopyStream,
+        /// Pending async H2D into staging_alt for the predicted next MoE layer.
+        h2d_prefetch: Option<ExpertH2dPrefetch>,
+        /// Disable async expert H2D (PULSAR_NO_ASYNC_H2D=1) — blocking path.
+        async_expert_h2d: bool,
         expert_ptrs: DeviceBuf,
         kcache: Vec<DeviceBuf>,
         vcache: Vec<DeviceBuf>,
@@ -3066,6 +3242,17 @@ mod real {
         qwen35: Option<qwen35::Qwen35Rt>,
     }
 
+    /// Cross-layer expert H2D prefetch: slabs already copied into `staging_alt`
+    /// (or primary staging when parity flips) for the predicted next MoE layer.
+    struct ExpertH2dPrefetch {
+        /// layer index the prefetch was built for
+        layer: usize,
+        /// offset -> device pointer inside the alt staging buffer
+        map: std::collections::HashMap<u64, *const std::ffi::c_void>,
+        /// true once `expert_h2d.record` was issued for this batch
+        recorded: bool,
+    }
+
     impl State {
         pub fn new(m: &Model, ctx: u32) -> Result<State> {
             // Mla keeps ~12GB of pinned attn weights in RAM; leave the
@@ -3147,52 +3334,138 @@ mod real {
             Ok(())
         }
 
-        /// Load the popularity census: hottest slabs into VRAM, the next
-        /// tier into the host cache, touch counts seeded for admission.
+        /// Load the popularity census: hottest **expert triples** into VRAM
+        /// (gate+up+down colocated so a hit never leaves a sibling on disk),
+        /// the next tier into the host cache, touch counts seeded for admission.
         fn load_warm(&mut self, m: &Model) -> Result<usize> {
             let Ok(bytes) = std::fs::read(warm_path(&m.path)) else {
                 return Ok(0);
             };
-            let mut entries = Vec::with_capacity(bytes.len() / 24);
+            let mut heat: std::collections::HashMap<u64, (u64, u64)> =
+                std::collections::HashMap::with_capacity(bytes.len() / 24);
             for c in bytes.chunks_exact(24) {
                 let off = u64::from_le_bytes(c[0..8].try_into().unwrap());
                 let len = u64::from_le_bytes(c[8..16].try_into().unwrap());
                 let count = u64::from_le_bytes(c[16..24].try_into().unwrap());
-                entries.push((off, len, count));
+                heat.insert(off, (count, len));
             }
-            // tier-resident slabs never reach the caches - don't preload them
             let in_tier =
                 |off: u64| self.tiers.iter().any(|t| t.map.contains_key(&off));
-            let entries: Vec<_> =
-                entries.into_iter().filter(|&(off, _, _)| !in_tier(off)).collect();
-            for &(off, len, count) in &entries {
+            // Rank whole triples by summed slab heat. Fill VRAM with complete
+            // triples only (slot count floored to a multiple of 3).
+            let mut triples: Vec<(u64, [(u64, u64); 3])> = Vec::new();
+            for l in &m.layers {
+                let Ffn::Moe {
+                    gate_exps,
+                    up_exps,
+                    down_exps,
+                    sink,
+                    ..
+                } = &l.ffn
+                else {
+                    continue;
+                };
+                for e in 0..m.shape.n_expert as u64 {
+                    let slabs = [gate_exps, up_exps, down_exps]
+                        .map(|t| (t.abs_offset + e * t.expert_bytes, t.expert_bytes));
+                    if slabs.iter().any(|(off, _)| in_tier(*off)) {
+                        continue;
+                    }
+                    let h: u64 = slabs
+                        .iter()
+                        .map(|(off, _)| heat.get(off).map(|x| x.0).unwrap_or(0))
+                        .sum();
+                    if h > 0 {
+                        triples.push((h, slabs));
+                    }
+                }
+                if let Some(sk) = sink {
+                    for e in 0..m.shape.n_shexp_sink as u64 {
+                        let slabs = [&sk[0], &sk[1], &sk[2]]
+                            .map(|t| (t.abs_offset + e * t.expert_bytes, t.expert_bytes));
+                        if slabs.iter().any(|(off, _)| in_tier(*off)) {
+                            continue;
+                        }
+                        let h: u64 = slabs
+                            .iter()
+                            .map(|(off, _)| heat.get(off).map(|x| x.0).unwrap_or(0))
+                            .sum();
+                        if h > 0 {
+                            triples.push((h, slabs));
+                        }
+                    }
+                }
+            }
+            triples.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            // seed touch for every census entry (including slabs not in a triple)
+            for (&off, &(count, len)) in &heat {
+                if in_tier(off) {
+                    continue;
+                }
                 self.dev_cache.touch.insert(off, (count, len));
                 self.warm_seeds.insert(off, count);
             }
             let dev_slots = self.dev_cache.meta.len();
-            let dev_tier: Vec<stream::Read> = entries
-                .iter()
-                .take(dev_slots)
-                .map(|&(offset, len, _)| stream::Read { offset, len })
-                .collect();
+            let n_dev_triples = dev_slots / 3;
+            let mut dev_reads: Vec<stream::Read> = Vec::with_capacity(n_dev_triples * 3);
+            let mut host_reads: Vec<stream::Read> = Vec::new();
             let host_budget = self.store.budget as u64;
             let mut host_bytes = 0u64;
-            let host_tier: Vec<stream::Read> = entries
+            for (i, (_h, slabs)) in triples.iter().enumerate() {
+                let reads = slabs.map(|(offset, len)| stream::Read { offset, len });
+                if i < n_dev_triples {
+                    dev_reads.extend_from_slice(&reads);
+                } else {
+                    let need: u64 = reads.iter().map(|r| r.len).sum();
+                    if host_bytes + need > host_budget {
+                        break;
+                    }
+                    host_bytes += need;
+                    host_reads.extend_from_slice(&reads);
+                }
+            }
+            // any remaining hot singleton census entries not covered by triples
+            // still seed host if budget remains (fused odd tensors, etc.)
+            let covered: std::collections::HashSet<u64> = dev_reads
                 .iter()
-                .skip(dev_slots)
-                .take_while(|&&(_, len, _)| {
-                    host_bytes += len;
-                    host_bytes <= host_budget
-                })
-                .map(|&(offset, len, _)| stream::Read { offset, len })
+                .chain(host_reads.iter())
+                .map(|r| r.offset)
                 .collect();
-            let n = dev_tier.len() + host_tier.len();
-            let dev_cache = &mut self.dev_cache;
-            self.store.fetch_direct(&dev_tier, |off, payload| {
-                dev_cache.maybe_insert(off, payload, &[])?;
-                Ok(())
-            })?;
-            self.store.ensure_with(&host_tier, |_, _| Ok(()))?;
+            let mut extras: Vec<(u64, u64, u64)> = heat
+                .iter()
+                .filter(|(&off, _)| !covered.contains(&off) && !in_tier(off))
+                .map(|(&off, &(count, len))| (count, off, len))
+                .collect();
+            extras.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            for &(_c, offset, len) in &extras {
+                if host_bytes + len > host_budget {
+                    break;
+                }
+                host_bytes += len;
+                host_reads.push(stream::Read { offset, len });
+            }
+            let n = dev_reads.len() + host_reads.len();
+            // fetch VRAM triples one group at a time (avoid holding all
+            // payloads in host RAM twice during warm load)
+            for chunk in dev_reads.chunks_exact(3) {
+                let mut pending: std::collections::HashMap<u64, Vec<u8>> =
+                    std::collections::HashMap::with_capacity(3);
+                self.store.fetch_direct(chunk, |off, payload| {
+                    pending.insert(off, payload.to_vec());
+                    Ok(())
+                })?;
+                let g = chunk[0].offset;
+                let u = chunk[1].offset;
+                let d = chunk[2].offset;
+                let gp = pending.get(&g).map(|v| v.as_slice()).unwrap_or(&[]);
+                let up = pending.get(&u).map(|v| v.as_slice()).unwrap_or(&[]);
+                let dp = pending.get(&d).map(|v| v.as_slice()).unwrap_or(&[]);
+                if gp.is_empty() || up.is_empty() || dp.is_empty() {
+                    continue;
+                }
+                let _ = self.dev_cache.maybe_insert_triple(&[(g, gp), (u, up), (d, dp)], &[])?;
+            }
+            self.store.ensure_with(&host_reads, |_, _| Ok(()))?;
             self.store.reset_stats();
             self.dev_cache.hits = 0;
             self.dev_cache.misses = 0;
@@ -3449,6 +3722,10 @@ mod real {
                 dev_cache: DeviceSlabCache::new(1, max_slab)?,
                 warm_seeds: std::collections::HashMap::new(),
                 staging: DeviceBuf::alloc(1)?,
+                staging_alt: DeviceBuf::alloc(1)?,
+                expert_h2d: kernels::CopyStream::new()?,
+                h2d_prefetch: None,
+                async_expert_h2d: std::env::var_os("PULSAR_NO_ASYNC_H2D").is_none(),
                 expert_ptrs: DeviceBuf::alloc(
                     mb as usize * n_used * std::mem::size_of::<ExpertPtrs>(),
                 )?,
@@ -3614,7 +3891,10 @@ mod real {
                         }
                         c.max(1)
                     };
-                    // decode floor: one layer's slot resolve always fits
+                    // decode floor: one layer's slot resolve always fits.
+                    // Only the primary staging arena is reserved from the
+                    // budget; staging_alt (cross-layer async H2D) grows on
+                    // demand so we do not steal ~2.5GB from the expert cache.
                     let staging_bytes = stage_worst(chunk).max(n_used * 3 * max_slab);
                     let dev_bytes = match dev_env {
                         Some(b) => b.max(1),
@@ -3624,6 +3904,8 @@ mod real {
                     };
                     st.dev_cache = DeviceSlabCache::new(dev_bytes, max_slab)?;
                     st.staging = DeviceBuf::alloc(staging_bytes + SLAB_SLACK)?;
+                    // keep 1-byte placeholder; grown on first cross-layer prefetch
+                    st.staging_alt = DeviceBuf::alloc(1)?;
                     st.max_batch = (chunk as u32).clamp(1, st.max_batch);
                     eprintln!(
                         "pulsar: auto budget: {:.1}GB VRAM free -> expert cache {:.1}GB, staging {:.1}GB, prefill chunk {}",
@@ -4172,13 +4454,19 @@ mod real {
                         kernels::sync()?;
                         st.prof.sync += t_sync.elapsed();
                         let t_resolve = std::time::Instant::now();
+                        let t_d2h = std::time::Instant::now();
                         let selected = st
                             .router_selected
                             .read_i32(n_tok as usize * s.n_expert_used as usize)?;
-                        if let Some((_, _, next_exps)) = &next_moe {
-                            let pred = st.pred_selected.read_i32(s.n_expert_used as usize)?;
+                        let pred_ids = if next_moe.is_some() {
+                            Some(st.pred_selected.read_i32(s.n_expert_used as usize)?)
+                        } else {
+                            None
+                        };
+                        st.prof.resolve_d2h += t_d2h.elapsed();
+                        if let (Some((_, _, next_exps)), Some(pred)) = (&next_moe, &pred_ids) {
                             let mut reads = Vec::with_capacity(3 * pred.len());
-                            for &e in &pred {
+                            for &e in pred {
                                 if e < 0 || e as u32 >= s.n_expert {
                                     continue;
                                 }
@@ -4229,10 +4517,35 @@ mod real {
                                 }
                             }
                         }
-                        // absorb whatever the prefetcher finished
+                        // Claim cross-layer async H2D BEFORE absorb: host
+                        // DMA must finish before the host LFU can free the
+                        // source pinned slabs.
+                        let mut resolved = std::collections::HashMap::new();
+                        if let Some(pf) = st.h2d_prefetch.take() {
+                            if pf.layer == il {
+                                if pf.recorded {
+                                    let t = std::time::Instant::now();
+                                    st.expert_h2d.synchronize()?;
+                                    st.expert_h2d.wait_default()?;
+                                    st.prof.h2d += t.elapsed();
+                                }
+                                for (off, p) in pf.map {
+                                    resolved.insert(off, p);
+                                }
+                            } else if pf.recorded {
+                                // stale prediction — must drain DMA before
+                                // absorb can free host sources; count as h2d
+                                // so it does not pollute disk/host
+                                let t = std::time::Instant::now();
+                                let _ = st.expert_h2d.synchronize();
+                                st.prof.h2d += t.elapsed();
+                            }
+                        }
+                        // absorb whatever the disk prefetcher finished
                         while let Ok((off, slab)) = st.prefetcher.done_rx.try_recv() {
                             st.store.absorb(off, slab);
                         }
+                        let t_lists = std::time::Instant::now();
                         // gate/up/down may use different quants (K-quant
                         // recipes put ffn_down a tier higher); staging
                         // slots are strided by the largest of the three
@@ -4256,43 +4569,43 @@ mod real {
                             }
                         };
                         let off_of = |t: &ExpertTensor, le: u64| t.abs_offset + le * t.expert_bytes;
-                        // resident-tier experts compute on their own card;
-                        // they are never fetched, cached, or staged here.
-                        // Sink ids resolve into the tier too (their census
-                        // heat ranks them first at placement) - the bool
-                        // says which launch pair serves them.
-                        let tier_of = |e: i32| -> Option<(usize, ExpertPtrs, bool)> {
+                        // resolve tier placement once per distinct expert
+                        // (was recomputed in cpu/offsets/ptrs loops)
+                        let mut tier_place: std::collections::HashMap<
+                            i32,
+                            (usize, ExpertPtrs, bool),
+                        > = std::collections::HashMap::with_capacity(distinct.len());
+                        for &e in &distinct {
                             let is_sink = e as u32 >= s.n_expert;
                             let [g3, u3, d3] = slabs_of(e as u32);
                             let g = off_of(g3.0, g3.1);
-                            // resident MTP experts beat a tier copy (same
-                            // device as the compute, no partial gather)
                             if !is_sink
                                 && self.mtp.as_ref().is_some_and(|mt| mt.res_map.contains_key(&g))
                             {
-                                return None;
+                                continue;
                             }
-                            st.tiers.iter().enumerate().find_map(|(ti, t)| {
+                            if let Some(place) = st.tiers.iter().enumerate().find_map(|(ti, t)| {
                                 let gate = *t.map.get(&g)?;
-                                Some((ti, ExpertPtrs {
-                                    gate,
-                                    up: byte_off(
-                                        *t.map.get(&off_of(u3.0, u3.1))?,
-                                        if is_sink { 0 } else { *fused_up_off },
-                                    ),
-                                    down: *t.map.get(&off_of(d3.0, d3.1))?,
-                                }, is_sink))
-                            })
-                        };
-                        // CPU expert lane (PULSAR_CPU=1): iq2_xxs experts
-                        // whose three slabs all sit in the host cache (and
-                        // none in VRAM) never cross PCIe - the worker pool
-                        // dots them from store memory under the GPU resolve
-                        // and a ~20KB f32 partial joins moe_out after the
-                        // tier gather. Decode-shaped batches only: prefill
-                        // amortizes each upload across the whole chunk, so
-                        // the GPU wins there. Float order differs from the
-                        // single-kernel path (same drift class as tiers).
+                                Some((
+                                    ti,
+                                    ExpertPtrs {
+                                        gate,
+                                        up: byte_off(
+                                            *t.map.get(&off_of(u3.0, u3.1))?,
+                                            if is_sink { 0 } else { *fused_up_off },
+                                        ),
+                                        down: *t.map.get(&off_of(d3.0, d3.1))?,
+                                    },
+                                    is_sink,
+                                ))
+                            }) {
+                                tier_place.insert(e, place);
+                            }
+                        }
+                        let tier_of =
+                            |e: i32| -> Option<(usize, ExpertPtrs, bool)> { tier_place.get(&e).copied() };
+                        // CPU expert lane (PULSAR_CPU=1): host-cache-hit
+                        // experts compute on CPU; decode-shaped batches only.
                         let cpu_on = st.cpu_pool.is_some()
                             && n_tok <= 8
                             && !st.unified
@@ -4332,6 +4645,8 @@ mod real {
                                 let [g3, u3, d3] = slabs_of(e as u32);
                                 let (go, uo, dno) =
                                     (off_of(g3.0, g3.1), off_of(u3.0, u3.1), off_of(d3.0, d3.1));
+                                // PULSAR_CPU_STEAL=0: leave VRAM-resident experts
+                                // on the GPU (weak-CPU / high-coverage boxes).
                                 if !cpu_steal
                                     && (st.dev_cache.map.contains_key(&go)
                                         || st.dev_cache.map.contains_key(&uo)
@@ -4363,8 +4678,10 @@ mod real {
                             st.store.pinned = pins;
                         }
                         if !lane.is_empty() {
+                            let t_cpu_d2h = std::time::Instant::now();
                             let rw = st.router_weights.read_f32(n_tok as usize * n_used)?;
                             let normed_h = st.normed.read_f32(n_tok as usize * ne)?;
+                            st.prof.resolve_d2h += t_cpu_d2h.elapsed();
                             let pool = st.cpu_pool.as_ref().unwrap();
                             cpu_guard = Some(cpu_tier::WaitGuard {
                                 pool,
@@ -4375,8 +4692,6 @@ mod real {
                             Vec::with_capacity(3 * distinct.len());
                         for &e in &distinct {
                             if tier_of(e).is_some() {
-                                // keep the census warm for resident slabs
-                                // or their heat freezes at placement time
                                 for (t, le) in slabs_of(e as u32) {
                                     let off = off_of(t, le);
                                     st.dev_cache.touch.entry(off).or_insert((0, t.expert_bytes)).0 += 1;
@@ -4384,10 +4699,6 @@ mod real {
                                 continue;
                             }
                             if lane.idx.contains_key(&e) {
-                                // CPU-lane experts: no fetch, no upload,
-                                // and NO census touch - bumping their heat
-                                // gets them VRAM-seeded at next load, which
-                                // churns the cache equilibrium run to run.
                                 continue;
                             }
                             for (t, le) in slabs_of(e as u32) {
@@ -4395,27 +4706,29 @@ mod real {
                                     offset: off_of(t, le),
                                     len: t.expert_bytes,
                                 };
-                                // fused gate_up: gate and up share a slab -
-                                // one read serves both
                                 if offsets.last().map(|l: &stream::Read| l.offset) != Some(r.offset) {
                                     offsets.push(r);
                                 }
                             }
                         }
                         let in_use: Vec<u64> = offsets.iter().map(|r| r.offset).collect();
-                        let mut resolved = std::collections::HashMap::new();
                         let mut wants = Vec::new();
                         for r in &offsets {
-                            // MTP draft-layer experts are fully resident on
-                            // the primary - never cached, never fetched
                             if let Some(mt) = &self.mtp {
                                 if let Some(&po) = mt.res_map.get(&r.offset) {
                                     resolved.insert(r.offset, mt.res_pool.ptr_at(po));
                                     continue;
                                 }
                             }
+                            if resolved.contains_key(&r.offset) {
+                                st.dev_cache
+                                    .touch
+                                    .entry(r.offset)
+                                    .or_insert((0, r.len))
+                                    .0 += 1;
+                                continue;
+                            }
                             if st.unified {
-                                // zero-copy: the host cache IS device memory
                                 wants.push(*r);
                                 continue;
                             }
@@ -4426,11 +4739,8 @@ mod real {
                                 None => wants.push(*r),
                             }
                         }
-                        // staging packs each want at its OWN size (sizes
-                        // differ per tensor - inkling's sink bank slabs are
-                        // several times the iq2 routed ones, and a uniform
-                        // max stride blew the buffer up 5x). Completion
-                        // order is arbitrary, so bases are precomputed.
+                        st.prof.resolve_lists += t_lists.elapsed();
+                        // Host LFU first; H2D overlaps remaining disk reads.
                         let mut stage_base = std::collections::HashMap::new();
                         let mut stage_total = 0usize;
                         for r in &wants {
@@ -4441,30 +4751,55 @@ mod real {
                             st.staging = DeviceBuf::alloc(stage_total + SLAB_SLACK)?;
                         }
                         let unified = st.unified;
-                        let dev_cache = &mut st.dev_cache;
-                        let staging = &mut st.staging;
+                        let async_h2d = st.async_expert_h2d;
                         let mut h2d = std::time::Duration::ZERO;
-                        st.store.ensure_with(&wants, |off, payload| {
-                            if unified {
-                                // pinned host slab is device-visible at
-                                // full speed; hand the pointer straight
-                                // to the kernels (UVA: host ptr == dev ptr)
-                                resolved.insert(off, payload.as_ptr() as *const std::ffi::c_void);
-                                return Ok(());
-                            }
-                            let t = std::time::Instant::now();
-                            let p = match dev_cache.maybe_insert(off, payload, &in_use)? {
-                                Some(p) => p,
-                                None => {
-                                    let base = stage_base[&off];
-                                    staging.write(base, payload)?;
-                                    staging.ptr_at(base)
+                        let mut async_queued = false;
+                        let t_host = std::time::Instant::now();
+                        {
+                            let dev_cache = &mut st.dev_cache;
+                            let staging = &mut st.staging;
+                            let expert_h2d = &st.expert_h2d;
+                            st.store.ensure_with(&wants, |off, payload| {
+                                if unified {
+                                    resolved.insert(
+                                        off,
+                                        payload.as_ptr() as *const std::ffi::c_void,
+                                    );
+                                    return Ok(());
                                 }
-                            };
+                                let t = std::time::Instant::now();
+                                let p = match dev_cache.maybe_insert(off, payload, &in_use)? {
+                                    Some(p) => p,
+                                    None => {
+                                        let base = stage_base[&off];
+                                        if async_h2d {
+                                            expert_h2d.copy_h2d_raw(
+                                                staging,
+                                                base,
+                                                payload.as_ptr(),
+                                                payload.len(),
+                                            )?;
+                                            async_queued = true;
+                                        } else {
+                                            staging.write(base, payload)?;
+                                        }
+                                        staging.ptr_at(base)
+                                    }
+                                };
+                                h2d += t.elapsed();
+                                resolved.insert(off, p);
+                                Ok(())
+                            })?;
+                        }
+                        let ensure_elapsed = t_host.elapsed();
+                        // host bucket = ensure wall minus nested h2d copies
+                        st.prof.resolve_host += ensure_elapsed.saturating_sub(h2d);
+                        if async_queued {
+                            let t = std::time::Instant::now();
+                            st.expert_h2d.record()?;
+                            st.expert_h2d.wait_default()?;
                             h2d += t.elapsed();
-                            resolved.insert(off, p);
-                            Ok(())
-                        })?;
+                        }
                         st.prof.h2d += h2d;
                         // sink slabs join the routed launch only when the
                         // bank shares quant AND row width; otherwise they
@@ -4678,6 +5013,95 @@ mod real {
                                 s.n_ff_exp, s.n_embd, s.n_expert_used, n_tok, sk[2].row_bytes, sk[2].quant,
                             )?;
                             kernels::add_assign(&mut st.moe_out, &st.ffn_out, n_tok * s.n_embd)?;
+                        }
+
+                        // Cross-layer async H2D (OPT-IN: PULSAR_H2D_PREFETCH=1).
+                        // Wrong predictions leave a recorded event that the next
+                        // layer must host-synchronize before absorb — that wait
+                        // lands in resolve "disk/host" and cost ~seconds on GLM.
+                        // Same-layer async H2D (above) stays on by default.
+                        if st.async_expert_h2d
+                            && !st.unified
+                            && n_tok == 1
+                            && std::env::var_os("PULSAR_H2D_PREFETCH").is_some()
+                            && std::env::var_os("PULSAR_NO_PREFETCH").is_none()
+                        {
+                            if let Some((_, _, next_exps)) = &next_moe {
+                                if let Ok(pred) =
+                                    st.pred_selected.read_i32(s.n_expert_used as usize)
+                                {
+                                    let mut pf_reads: Vec<stream::Read> = Vec::new();
+                                    for &e in &pred {
+                                        if e < 0 || e as u32 >= s.n_expert {
+                                            continue;
+                                        }
+                                        for t in next_exps {
+                                            let offset =
+                                                t.abs_offset + e as u64 * t.expert_bytes;
+                                            if st.tiers.iter().any(|tr| tr.map.contains_key(&offset))
+                                                || st.dev_cache.peek(offset).is_some()
+                                                || self.mtp.as_ref().is_some_and(|mt| {
+                                                    mt.res_map.contains_key(&offset)
+                                                })
+                                            {
+                                                continue;
+                                            }
+                                            if pf_reads.iter().any(|r| r.offset == offset) {
+                                                continue;
+                                            }
+                                            // host must already hold the slab
+                                            // (disk prefetcher / warm); skip if not
+                                            if !st.store.contains(offset) {
+                                                continue;
+                                            }
+                                            pf_reads.push(stream::Read {
+                                                offset,
+                                                len: t.expert_bytes,
+                                            });
+                                        }
+                                    }
+                                    if !pf_reads.is_empty() {
+                                        let mut stage_total = 0usize;
+                                        let mut bases = std::collections::HashMap::new();
+                                        for r in &pf_reads {
+                                            bases.insert(r.offset, stage_total);
+                                            stage_total += r.len as usize;
+                                        }
+                                        if stage_total + SLAB_SLACK > st.staging_alt.bytes() {
+                                            st.staging_alt =
+                                                DeviceBuf::alloc(stage_total + SLAB_SLACK)?;
+                                        }
+                                        // default-stream MoE is already queued;
+                                        // side-stream H2D runs concurrently.
+                                        let mut map = std::collections::HashMap::new();
+                                        let mut queued = false;
+                                        for r in &pf_reads {
+                                            if let Some(payload) = st.store.payload(r.offset) {
+                                                let base = bases[&r.offset];
+                                                st.expert_h2d.copy_h2d_raw(
+                                                    &mut st.staging_alt,
+                                                    base,
+                                                    payload.as_ptr(),
+                                                    payload.len(),
+                                                )?;
+                                                map.insert(
+                                                    r.offset,
+                                                    st.staging_alt.ptr_at(base),
+                                                );
+                                                queued = true;
+                                            }
+                                        }
+                                        if queued {
+                                            st.expert_h2d.record()?;
+                                            st.h2d_prefetch = Some(ExpertH2dPrefetch {
+                                                layer: il + 1,
+                                                map,
+                                                recorded: true,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
                         }
 
                         // gather tier partials (blocking copy issued on the
