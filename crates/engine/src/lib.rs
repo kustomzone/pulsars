@@ -1784,6 +1784,24 @@ mod real {
         Ok(DeviceBuf::from_f32(&read_f16_as_f32(file, g, name)?)?)
     }
 
+    /// Tensor -> device f32 regardless of source encoding. Small tensors
+    /// whose consumers are matmul_f32 (qwen35 ssm_alpha/ssm_beta): dense
+    /// 27B files K-quantize them where the 35B shipped f32.
+    fn upload_as_f32(file: &VFile, g: &Gguf, name: &str) -> Result<DeviceBuf> {
+        let t = g.tensor(name).ok_or_else(|| meta_err(name))?;
+        match t.ty {
+            TensorType::F32 => upload(file, g, name),
+            TensorType::F16 => upload_f16_as_f32(file, g, name),
+            TensorType::Q4K => {
+                let n = t.n_elements() as usize;
+                let mut buf = vec![0u8; n / 256 * 144];
+                file.read_exact_at(&mut buf, g.data_offset + t.offset)?;
+                Ok(DeviceBuf::from_f32(&quant::cpu_dot::dequant_q4_k(&buf, n))?)
+            }
+            other => Err(format!("{name}: no f32 path for {other:?}").into()),
+        }
+    }
+
     /// f16 tensor -> q8_0 bytes (deepseek4's bigger f16 matmul weights
     /// ride the q8_0 fast path; ~0.4% quantization noise).
     fn read_f16_as_q8(file: &VFile, g: &Gguf, name: &str) -> Result<Vec<u8>> {
@@ -2358,8 +2376,8 @@ mod real {
                                     wqkv: upload(&file, &gguf, &t("attn_qkv.weight"))?,
                                     wz: upload(&file, &gguf, &t("attn_gate.weight"))?,
                                     conv: upload(&file, &gguf, &t("ssm_conv1d.weight"))?,
-                                    alpha_w: upload(&file, &gguf, &t("ssm_alpha.weight"))?,
-                                    beta_w: upload(&file, &gguf, &t("ssm_beta.weight"))?,
+                                    alpha_w: upload_as_f32(&file, &gguf, &t("ssm_alpha.weight"))?,
+                                    beta_w: upload_as_f32(&file, &gguf, &t("ssm_beta.weight"))?,
                                     a: upload(&file, &gguf, &t("ssm_a"))?,
                                     dt_bias: upload(&file, &gguf, &t("ssm_dt.bias"))?,
                                     ssm_norm: upload(&file, &gguf, &t("ssm_norm.weight"))?,

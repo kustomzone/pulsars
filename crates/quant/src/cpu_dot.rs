@@ -201,6 +201,30 @@ pub fn vec_dot_q3_k_q8_k_scalar(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
     total
 }
 
+/// Full q4_K dequant to f32 (loader use: small f32-expected tensors that
+/// arrive K-quantized, e.g. qwen35-dense ssm_alpha/ssm_beta).
+pub fn dequant_q4_k(row: &[u8], n: usize) -> Vec<f32> {
+    let nb = n / QK_K;
+    let mut out = Vec::with_capacity(n);
+    for ibl in 0..nb {
+        let blk = &row[ibl * Q4_K_BLOCK_BYTES..(ibl + 1) * Q4_K_BLOCK_BYTES];
+        let xd = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let xmin = f16_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+        let (scales, q4) = (&blk[4..16], &blk[16..144]);
+        for j in 0..4 {
+            let (sc1, m1) = k4_scale_min(2 * j, scales);
+            let (sc2, m2) = k4_scale_min(2 * j + 1, scales);
+            for i in 0..32 {
+                out.push(xd * sc1 as f32 * (q4[32 * j + i] & 0x0f) as f32 - xmin * m1 as f32);
+            }
+            for i in 0..32 {
+                out.push(xd * sc2 as f32 * (q4[32 * j + i] >> 4) as f32 - xmin * m2 as f32);
+            }
+        }
+    }
+    out
+}
+
 pub fn vec_dot_q4_k_q8_k(row: &[u8], x: &Q8KRow, n: usize) -> f32 {
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("avx2") {
