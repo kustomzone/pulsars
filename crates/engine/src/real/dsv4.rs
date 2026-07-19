@@ -753,12 +753,14 @@ impl Model {
         let mut last_t = 1usize;
         for chunk in tokens.chunks(T_MAX) {
             let t = chunk.len();
-            // per-token visibility masks are computed inside the layer
-            // eval, so chunks stay batched at any depth (the old
-            // single-token fallback past 512 comp rows made deep prefill
-            // run at decode speed - 4x slower at 13K).
-            // PULSAR_DEEP_SINGLE=1 restores the fallback (debug A/B).
-            let t = if std::env::var_os("PULSAR_DEEP_SINGLE").is_some()
+            // PULSAR_DEEP_BATCH=1: keep chunks batched past the top-k
+            // boundary using per-token visibility masks (1.6-4x deep
+            // prefill; serve sets it). Default single-steps there: the
+            // batched deep path diverges from single-stepped at
+            // (pos 2048, L1) by an unexplained float-level delta -
+            // masks/selection verified faithful, drift-scale outputs,
+            // but not yet root-caused (task #39).
+            let t = if std::env::var_os("PULSAR_DEEP_BATCH").is_none()
                 && (pos + t as u32) / 4 > s.n_idx_topk
             {
                 1
