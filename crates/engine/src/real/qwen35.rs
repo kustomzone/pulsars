@@ -458,6 +458,10 @@ impl Model {
             kernels::embed_q8_0(&mut st.cur, &self.token_embd, &st.tok, s.n_embd, s.n_vocab, t)?;
             for (il, l) in self.layers.iter().enumerate() {
                 self.eval_qwen35_layer(st, rt, il, l, pos, t)?;
+                if std::env::var_os("PULSAR_DEBUG_L2").is_some() {
+                    let v = st.cur.read_f32(8)?;
+                    eprintln!("L{il}: {:?}", &v[..4.min(v.len())]);
+                }
             }
             pos += t;
             last_t = t;
