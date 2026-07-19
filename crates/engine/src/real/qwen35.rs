@@ -573,19 +573,25 @@ impl Model {
         let Ffn::Moe { gate_inp, probs_b, shexp, gate_exps, up_exps, down_exps, .. } = &l.ffn else {
             return Err("qwen35 layer without MoE ffn".into());
         };
-        kernels::matmul_f32(&mut st.router_logits, gate_inp, &st.normed, s.n_embd, s.n_expert, t)?;
-        kernels::router_select(
-            &mut st.router_selected,
-            &mut st.router_weights,
-            &st.router_logits,
-            probs_b,
-            s.n_expert,
-            s.n_expert_used,
-            s.expert_weight_scale,
-            t,
-            1, // softmax mode
-            0,
-        )?;
+        if s.n_expert > 1 {
+            kernels::matmul_f32(&mut st.router_logits, gate_inp, &st.normed, s.n_embd, s.n_expert, t)?;
+            kernels::router_select(
+                &mut st.router_selected,
+                &mut st.router_weights,
+                &st.router_logits,
+                probs_b,
+                s.n_expert,
+                s.n_expert_used,
+                s.expert_weight_scale,
+                t,
+                1, // softmax mode
+                0,
+            )?;
+        } else {
+            // dense-as-one-expert (qwen35 27B): expert 0, weight 1.0
+            let ones = vec![1.0f32; t as usize];
+            st.router_weights.write(0, kernels::as_bytes(&ones))?;
+        }
         if let Some((sg, su, sd)) = shexp {
             kernels::matmul_q8_0(&mut st.gate_act, sg, &st.normed, s.n_embd, s.n_ff_exp, t)?;
             kernels::matmul_q8_0(&mut st.up_act, su, &st.normed, s.n_embd, s.n_ff_exp, t)?;
@@ -598,7 +604,11 @@ impl Model {
         }
         kernels::quantize_q8_k(&mut st.xq, &st.normed, s.n_embd, t)?;
         kernels::sync()?;
-        let selected = st.router_selected.read_i32((t * s.n_expert_used) as usize)?;
+        let selected = if s.n_expert > 1 {
+            st.router_selected.read_i32((t * s.n_expert_used) as usize)?
+        } else {
+            vec![0i32; t as usize]
+        };
         self.dsv4_moe(st, &selected, gate_exps, up_exps, down_exps, 0, t)?;
         kernels::add(&mut st.ffn_out, &st.moe_out, &st.shared_out, t * s.n_embd)?;
         kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, t * s.n_embd)?;

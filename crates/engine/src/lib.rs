@@ -208,9 +208,14 @@ mod real {
                 Some("deepseek4") => Family::Dsv4,
                 // Qwen3.6-35B-A3B hybrid GDN (task #21)
                 Some("qwen35moe") => Family::Qwen35,
+                // Qwen3.6 dense (27B lineage, task #37): same GDN hybrid
+                // stack; the dense FFN loads as a single always-on expert
+                // so placement/caching/tiering machinery applies unchanged
+                Some("qwen35") => Family::Qwen35,
                 other => return Err(format!("unsupported architecture {other:?}").into()),
             };
             let inkling = g.architecture() == Some("inkling");
+            let qwen35_dense = g.architecture() == Some("qwen35");
             let n_layer = u("block_count")?;
             // deepseek4 ships its MTP block as a SEPARATE gguf: the main
             // file's nextn_predict_layers=1 does not shrink block_count
@@ -246,18 +251,29 @@ mod real {
                 // the ds4-lineage converter writes this KV; upstream
                 // llama.cpp (AngelSlim ggufs) omits it - infer it from
                 // where routed-expert tensors start
-                n_leading_dense: match u("leading_dense_block_count") {
-                    Ok(v) => v,
-                    Err(_) => (0..u("block_count")?)
-                        .find(|il| {
-                            g.tensor(&format!("blk.{il}.ffn_gate_exps.weight")).is_some()
-                                || g.tensor(&format!("blk.{il}.ffn_gate_up_exps.weight")).is_some()
-                        })
-                        .ok_or_else(|| meta_err("no MoE layers found"))?,
+                // qwen35-dense: every FFN is the one-expert synthesis,
+                // so no layer is "leading dense" (that path re-quantizes
+                // to q8_0 resident, 1.7x the bytes of the native K-quants)
+                n_leading_dense: if qwen35_dense {
+                    0
+                } else {
+                    match u("leading_dense_block_count") {
+                        Ok(v) => v,
+                        Err(_) => (0..u("block_count")?)
+                            .find(|il| {
+                                g.tensor(&format!("blk.{il}.ffn_gate_exps.weight")).is_some()
+                                    || g.tensor(&format!("blk.{il}.ffn_gate_up_exps.weight")).is_some()
+                            })
+                            .ok_or_else(|| meta_err("no MoE layers found"))?,
+                    }
                 },
-                n_expert: u("expert_count")?,
-                n_expert_used: u("expert_used_count")?,
-                n_ff_exp: u("expert_feed_forward_length")?,
+                n_expert: if qwen35_dense { 1 } else { u("expert_count")? },
+                n_expert_used: if qwen35_dense { 1 } else { u("expert_used_count")? },
+                n_ff_exp: if qwen35_dense {
+                    u("feed_forward_length")?
+                } else {
+                    u("expert_feed_forward_length")?
+                },
                 // deepseek4/qwen35moe have no dense FFN layers and omit the key
                 n_ff_dense: match family {
                     Family::Dsv4 | Family::Qwen35 => u("feed_forward_length")
@@ -2125,18 +2141,29 @@ mod real {
                     // 0..n_ff are gate, n_ff..2n_ff are up. One slab per
                     // expert serves both (up = gate ptr + fused_up_off).
                     let fused = gguf.tensor(&t("ffn_gate_up_exps.weight")).is_some();
+                    // qwen35-dense: plain ffn_gate/up/down ARE the single
+                    // expert (native K-quant bytes, tiered like any expert)
+                    let dense_ffn = !fused && gguf.tensor(&t("ffn_gate_exps.weight")).is_none();
                     let (gate_exps, up_exps, fused_up_off) = if fused {
                         let g = exps("ffn_gate_up_exps.weight")?;
                         let off = g.row_bytes * shape.n_ff_exp as u64;
                         let u = g.clone();
                         (g, u, off)
+                    } else if dense_ffn {
+                        (exps("ffn_gate.weight")?, exps("ffn_up.weight")?, 0)
                     } else {
                         (exps("ffn_gate_exps.weight")?, exps("ffn_up_exps.weight")?, 0)
                     };
                     Ffn::Moe {
                         // deepseek4 ships the router f16; matmul_f32
                         // wants f32 (router precision drives selection)
-                        gate_inp: if dsv4_arch {
+                        gate_inp: if dense_ffn {
+                            // one expert, no router - dummy buffer, the
+                            // qwen35 ffn half bypasses selection entirely
+                            let mut z = DeviceBuf::alloc(4)?;
+                            kernels::zero(&mut z, 4)?;
+                            z
+                        } else if dsv4_arch {
                             upload_f16_as_f32(&file, &gguf, &t("ffn_gate_inp.weight"))?
                         } else {
                             upload(&file, &gguf, &t("ffn_gate_inp.weight"))?
@@ -2170,7 +2197,11 @@ mod real {
                         },
                         gate_exps,
                         up_exps,
-                        down_exps: exps("ffn_down_exps.weight")?,
+                        down_exps: if dense_ffn {
+                            exps("ffn_down.weight")?
+                        } else {
+                            exps("ffn_down_exps.weight")?
+                        },
                         fused_up_off,
                         down_scale: if gguf.tensor(&t("ffn_down_exps.scale")).is_some() {
                             Some(upload(&file, &gguf, &t("ffn_down_exps.scale"))?)
