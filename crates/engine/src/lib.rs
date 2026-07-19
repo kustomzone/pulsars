@@ -2366,7 +2366,13 @@ mod real {
                                     ssm_out: upload(&file, &gguf, &t("ssm_out.weight"))?,
                                 })
                             },
-                            shexp_gate: upload(&file, &gguf, &t("ffn_gate_inp_shexp.weight"))?,
+                            // dense qwen35 has no shared expert (and so
+                            // no shexp gate); the ffn half never reads it
+                            shexp_gate: if gguf.tensor(&t("ffn_gate_inp_shexp.weight")).is_some() {
+                                upload(&file, &gguf, &t("ffn_gate_inp_shexp.weight"))?
+                            } else {
+                                DeviceBuf::alloc(4)?
+                            },
                         }))
                     }
                 };
