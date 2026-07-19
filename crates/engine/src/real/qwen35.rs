@@ -769,6 +769,16 @@ impl Model {
         kernels::add(&mut st.after_attn, &st.cur, &st.attn_out, t * s.n_embd)?;
 
         // ---- FFN (pre-norm residual)
+        // PULSAR_DENSE_PROF=1: sync-bracketed phase totals (attn+GDN into
+        // the gpu-wait bucket, dense ffn into resolve). Syncs distort the
+        // absolute rate - read the SPLIT, not the total.
+        let prof = std::env::var_os("PULSAR_DENSE_PROF").is_some();
+        let mut mark = std::time::Instant::now();
+        if prof {
+            kernels::sync()?;
+            st.prof.sync += mark.elapsed();
+            mark = std::time::Instant::now();
+        }
         kernels::rms_norm(&mut st.normed, &st.after_attn, &l.ffn_norm, s.n_embd, t, eps)?;
         if let Ffn::DenseKq { gate, up, down } = &l.ffn {
             // dense 27B: resident K-quant triple, no experts, no syncs
@@ -779,6 +789,10 @@ impl Model {
             kernels::quantize_q8_k(&mut st.midq, &st.ffn_mid, s.n_ff_exp, t)?;
             kernels::matmul_kq(&mut st.ffn_out, &down.w, &st.midq, s.n_ff_exp, s.n_embd, t, down.row_bytes, down.quant)?;
             kernels::add(&mut st.cur, &st.after_attn, &st.ffn_out, t * s.n_embd)?;
+            if prof {
+                kernels::sync()?;
+                st.prof.resolve += mark.elapsed();
+            }
             return Ok(());
         }
         let Ffn::Moe { gate_inp, probs_b, shexp, gate_exps, up_exps, down_exps, .. } = &l.ffn else {
