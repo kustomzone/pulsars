@@ -815,7 +815,6 @@ mod real {
     /// at the router readback (== all attention/router kernel time),
     /// `resolve` the expert resolve wall time, of which `h2d` is spent in
     /// uploads to the device.
-    #[derive(Default)]
     /// A recurrent-state prefix checkpoint (position + family payload).
     /// KV rows are positional and rewritten on replay; only the rolling
     /// lane/GDN state needs copies.
@@ -824,6 +823,7 @@ mod real {
         Qwen35(Vec<Option<(DeviceBuf, DeviceBuf)>>),
     }
 
+    #[derive(Default)]
     pub struct Prof {
         pub sync: std::time::Duration,
         pub resolve: std::time::Duration,
@@ -3394,10 +3394,10 @@ mod real {
             let pos = self.ckpts[i].0;
             match &self.ckpts[i].1 {
                 RecurrentCkpt::Dsv4(ck) => {
-                    self.dsv4.as_mut().ok_or("dsv4 state missing")?.restore(ck)?
+                    self.dsv4.as_mut().ok_or("dsv4 state missing")?.ckpt_restore(ck)?
                 }
                 RecurrentCkpt::Qwen35(ck) => {
-                    self.qwen35.as_mut().ok_or("qwen35 state missing")?.restore(ck)?
+                    self.qwen35.as_mut().ok_or("qwen35 state missing")?.ckpt_restore(ck)?
                 }
             }
             self.ckpts.truncate(i + 1);

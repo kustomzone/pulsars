@@ -709,7 +709,7 @@ impl Dsv4Rt {
         Ok(out)
     }
 
-    pub(super) fn restore(&mut self, ck: &[Dsv4LayerCkpt]) -> Result {
+    pub(super) fn ckpt_restore(&mut self, ck: &[Dsv4LayerCkpt]) -> Result {
         for (l, c) in self.layers.iter_mut().zip(ck) {
             if let (Some(lane), Some((kv, sc))) = (&mut l.comp, &c.comp) {
                 kernels::copy_d2d(&mut lane.st_kv, 0, kv, 0, kv.bytes())?;

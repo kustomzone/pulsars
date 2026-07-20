@@ -355,7 +355,7 @@ impl Qwen35Rt {
         Ok(out)
     }
 
-    pub(super) fn restore(&mut self, ck: &[Option<(DeviceBuf, DeviceBuf)>]) -> Result {
+    pub(super) fn ckpt_restore(&mut self, ck: &[Option<(DeviceBuf, DeviceBuf)>]) -> Result {
         let primary = kernels::get_device();
         for (gs, c) in self.states.iter_mut().zip(ck) {
             if let (Some(g), Some((s2, c2))) = (gs, c) {
