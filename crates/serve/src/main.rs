@@ -320,10 +320,15 @@ fn handle_chat(
         eprintln!("pulsar-serve: prompt ids {prompt:?}");
     }
     if prompt.len() as u32 + 2 >= st.ctx() {
+        eprintln!(
+            "pulsar-serve: {id}: rejected, prompt {} tokens vs ctx {}",
+            prompt.len(),
+            st.ctx()
+        );
         return respond_json(
             stream,
             400,
-            &serde_json::json!({"error": {"message": "prompt exceeds context"}}),
+            &serde_json::json!({"error": {"message": format!("prompt exceeds context ({} tokens, ctx {})", prompt.len(), st.ctx())}}),
         );
     }
     let mut sampler = engine::Sampler::new(temp, top_p, min_p, seed);
