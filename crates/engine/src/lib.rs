@@ -816,6 +816,14 @@ mod real {
     /// `resolve` the expert resolve wall time, of which `h2d` is spent in
     /// uploads to the device.
     #[derive(Default)]
+    /// A recurrent-state prefix checkpoint (position + family payload).
+    /// KV rows are positional and rewritten on replay; only the rolling
+    /// lane/GDN state needs copies.
+    pub enum RecurrentCkpt {
+        Dsv4(Vec<dsv4::Dsv4LayerCkpt>),
+        Qwen35(Vec<Option<(DeviceBuf, DeviceBuf)>>),
+    }
+
     pub struct Prof {
         pub sync: std::time::Duration,
         pub resolve: std::time::Duration,
@@ -3289,6 +3297,9 @@ mod real {
         dsv4: Option<dsv4::Dsv4Rt>,
         /// qwen35 runtime (GDN conv+delta states); None elsewhere
         qwen35: Option<qwen35::Qwen35Rt>,
+        /// recurrent prefix checkpoints (pos ascending): a divergent
+        /// request resumes from the nearest one instead of position 0
+        ckpts: Vec<(u32, RecurrentCkpt)>,
     }
 
     /// Cross-layer expert H2D prefetch: slabs already copied into `staging_alt`
@@ -3334,6 +3345,67 @@ mod real {
 
         pub fn max_batch(&self) -> u32 {
             self.max_batch
+        }
+
+        /// Take a recurrent checkpoint at `pos` when the interval since
+        /// the last one has passed (no-op for pure-KV families). GDN
+        /// states are ~150MB per snapshot so qwen35 spaces them wide.
+        pub fn maybe_checkpoint(&mut self, m: &Model, pos: u32) -> Result {
+            if !m.recurrent_state() {
+                return Ok(());
+            }
+            let qwen = m.shape.family == Family::Qwen35;
+            let interval = if qwen { 4096 } else { 512 };
+            let cap = if qwen { 2 } else { 8 };
+            let last = self.ckpts.last().map(|(p, _)| *p).unwrap_or(0);
+            if pos < last + interval {
+                return Ok(());
+            }
+            let ck = match m.shape.family {
+                Family::Dsv4 => RecurrentCkpt::Dsv4(
+                    self.dsv4.as_ref().ok_or("dsv4 state missing")?.ckpt()?,
+                ),
+                Family::Qwen35 => RecurrentCkpt::Qwen35(
+                    self.qwen35.as_ref().ok_or("qwen35 state missing")?.ckpt()?,
+                ),
+                _ => return Ok(()),
+            };
+            self.ckpts.push((pos, ck));
+            if self.ckpts.len() > cap {
+                // keep the earliest (early divergences hurt most) and
+                // the recent tail
+                self.ckpts.remove(1);
+            }
+            Ok(())
+        }
+
+        /// Restore the latest checkpoint at or before `upto`; drops the
+        /// ones past it (their content no longer matches the stream).
+        /// Returns the restored position.
+        pub fn restore_nearest_ckpt(&mut self, m: &Model, upto: u32) -> Result<Option<u32>> {
+            let Some(i) = self
+                .ckpts
+                .iter()
+                .rposition(|(p, _)| *p <= upto)
+            else {
+                self.ckpts.clear();
+                return Ok(None);
+            };
+            let pos = self.ckpts[i].0;
+            match &self.ckpts[i].1 {
+                RecurrentCkpt::Dsv4(ck) => {
+                    self.dsv4.as_mut().ok_or("dsv4 state missing")?.restore(ck)?
+                }
+                RecurrentCkpt::Qwen35(ck) => {
+                    self.qwen35.as_mut().ok_or("qwen35 state missing")?.restore(ck)?
+                }
+            }
+            self.ckpts.truncate(i + 1);
+            Ok(Some(pos))
+        }
+
+        pub fn clear_ckpts(&mut self) {
+            self.ckpts.clear();
         }
 
         pub fn ctx(&self) -> u32 {
@@ -3885,6 +3957,7 @@ mod real {
                 } else {
                     None
                 },
+                ckpts: Vec::new(),
             };
 
             // ---- capacity solver: size the VRAM budget from MEASUREMENT.
@@ -5436,6 +5509,9 @@ mod real {
             st.max_batch() as usize
         };
         let prof_chunks = std::env::var_os("PULSAR_PROFILE").is_some();
+        if pos0 == 0 {
+            st.clear_ckpts();
+        }
         for chunk in prompt.chunks(chunk_cap) {
             if cancel() {
                 return Ok(pos);
@@ -5453,6 +5529,7 @@ mod real {
                 );
             }
             pos += chunk.len() as u32;
+            st.maybe_checkpoint(model, pos)?;
         }
 
         // Draft-free n-gram speculation (PULSAR_NGRAM=depth, greedy only):

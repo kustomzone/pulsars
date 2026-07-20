@@ -680,6 +680,60 @@ impl Dsv4Rt {
         }
         Ok(())
     }
+
+    /// Snapshot the recurrent lanes (compressor + indexer rolling state
+    /// and their counters). KV ring and compressed caches are positional
+    /// and get rewritten on replay, so they need no copy.
+    pub(super) fn ckpt(&self) -> Result<Vec<Dsv4LayerCkpt>> {
+        let copy = |b: &DeviceBuf| -> Result<DeviceBuf> {
+            let mut c = DeviceBuf::alloc(b.bytes())?;
+            kernels::copy_d2d(&mut c, 0, b, 0, b.bytes())?;
+            Ok(c)
+        };
+        let mut out = Vec::with_capacity(self.layers.len());
+        for l in &self.layers {
+            out.push(Dsv4LayerCkpt {
+                comp: match &l.comp {
+                    Some(c) => Some((copy(&c.st_kv)?, copy(&c.st_sc)?)),
+                    None => None,
+                },
+                n_comp: l.n_comp,
+                idx: match &l.idx {
+                    Some(c) => Some((copy(&c.st_kv)?, copy(&c.st_sc)?)),
+                    None => None,
+                },
+                n_idx_comp: l.n_idx_comp,
+                host_len: l.idx_cache_host.len(),
+            });
+        }
+        Ok(out)
+    }
+
+    pub(super) fn restore(&mut self, ck: &[Dsv4LayerCkpt]) -> Result {
+        for (l, c) in self.layers.iter_mut().zip(ck) {
+            if let (Some(lane), Some((kv, sc))) = (&mut l.comp, &c.comp) {
+                kernels::copy_d2d(&mut lane.st_kv, 0, kv, 0, kv.bytes())?;
+                kernels::copy_d2d(&mut lane.st_sc, 0, sc, 0, sc.bytes())?;
+            }
+            l.n_comp = c.n_comp;
+            if let (Some(lane), Some((kv, sc))) = (&mut l.idx, &c.idx) {
+                kernels::copy_d2d(&mut lane.st_kv, 0, kv, 0, kv.bytes())?;
+                kernels::copy_d2d(&mut lane.st_sc, 0, sc, 0, sc.bytes())?;
+            }
+            l.n_idx_comp = c.n_idx_comp;
+            l.idx_cache_host.truncate(c.host_len);
+        }
+        Ok(())
+    }
+}
+
+/// One layer's recurrent snapshot (dsv4).
+pub(super) struct Dsv4LayerCkpt {
+    comp: Option<(DeviceBuf, DeviceBuf)>,
+    n_comp: u32,
+    idx: Option<(DeviceBuf, DeviceBuf)>,
+    n_idx_comp: u32,
+    host_len: usize,
 }
 
 /* ---- indexer top-k selection (indexer_allowed_decode_one) --------------- */

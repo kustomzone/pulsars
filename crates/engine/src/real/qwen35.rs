@@ -333,6 +333,41 @@ impl Qwen35Rt {
         Ok(())
     }
 
+    /// Snapshot every GDN state for a prefix checkpoint (device-local
+    /// copies on each state's owner card).
+    pub(super) fn ckpt(&self) -> Result<Vec<Option<(DeviceBuf, DeviceBuf)>>> {
+        let primary = kernels::get_device();
+        let mut out = Vec::with_capacity(self.states.len());
+        for gs in &self.states {
+            out.push(match gs {
+                Some(g) => {
+                    kernels::set_device(g.dev)?;
+                    let mut s2 = DeviceBuf::alloc(g.s.bytes())?;
+                    kernels::copy_d2d(&mut s2, 0, &g.s, 0, g.s.bytes())?;
+                    let mut c2 = DeviceBuf::alloc(g.conv.bytes())?;
+                    kernels::copy_d2d(&mut c2, 0, &g.conv, 0, g.conv.bytes())?;
+                    Some((s2, c2))
+                }
+                None => None,
+            });
+        }
+        kernels::set_device(primary)?;
+        Ok(out)
+    }
+
+    pub(super) fn restore(&mut self, ck: &[Option<(DeviceBuf, DeviceBuf)>]) -> Result {
+        let primary = kernels::get_device();
+        for (gs, c) in self.states.iter_mut().zip(ck) {
+            if let (Some(g), Some((s2, c2))) = (gs, c) {
+                kernels::set_device(g.dev)?;
+                kernels::copy_d2d(&mut g.s, 0, s2, 0, s2.bytes())?;
+                kernels::copy_d2d(&mut g.conv, 0, c2, 0, c2.bytes())?;
+            }
+        }
+        kernels::set_device(primary)?;
+        Ok(())
+    }
+
     fn reset(&mut self) -> Result {
         let primary = kernels::get_device();
         for st in self.states.iter_mut().flatten() {
