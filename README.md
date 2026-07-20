@@ -80,13 +80,14 @@ streaming KV compressor, Sinkhorn hyper-connection gates) fully on
 device and prefills in batched 16-token chunks (~26 tok/s prefill
 with the CPU lane at shallow positions; past ~2K context the indexer
 top-k engages and the batched path used to fall back to single-token
-steps, decaying prefill to decode speed ~8 tok/s. PULSAR_DEEP_BATCH=1
-keeps deep chunks batched with per-token visibility masks - a 3.4K
-prompt drops 249s to 137s, larger prompts save proportionally more.
-Opt-in for now: the batched deep path diverges from single-stepping by
-a small float delta that is verified drift-scale (masks and the
-single-step mode are bit-faithful to the old build) but not yet
-root-caused; pulsar-serve sets it. one router readback and one expert union per
+steps, decaying prefill to decode speed ~8 tok/s. Deep chunks now stay
+batched with per-token visibility masks - a 3.4K prompt drops 249s to
+137s, larger prompts save proportionally more. The float delta vs
+single-stepping that briefly kept this opt-in was root-caused to
+matmul_q8_0's batch-size kernel dispatch (dp4a vs int8-MMA accumulate
+in different orders, tolerance-tested at 1e-3) - the same documented
+drift class as the tiers and grouped MoE, present in every chunked
+prefill. PULSAR_NO_DEEP_BATCH=1 restores exact single-stepping. one router readback and one expert union per
 chunk-layer, with the per-token ring/compressor/attention interleave
 preserved bit-exactly). Long-context retrieval verified by needle
 recall at 2.4k ctx through compressed rows.

@@ -764,14 +764,16 @@ impl Model {
         let mut last_t = 1usize;
         for chunk in tokens.chunks(T_MAX) {
             let t = chunk.len();
-            // PULSAR_DEEP_BATCH=1: keep chunks batched past the top-k
-            // boundary using per-token visibility masks (1.6-4x deep
-            // prefill; serve sets it). Default single-steps there: the
-            // batched deep path diverges from single-stepped at
-            // (pos 2048, L1) by an unexplained float-level delta -
-            // masks/selection verified faithful, drift-scale outputs,
-            // but not yet root-caused (task #39).
-            let t = if std::env::var_os("PULSAR_DEEP_BATCH").is_none()
+            // Deep chunks stay batched past the top-k boundary using
+            // per-token visibility masks (1.6-4x deep prefill). The
+            // batched-vs-single float difference that kept this opt-in
+            // for a night was root-caused to matmul_q8_0's batch-size
+            // kernel dispatch (warp8 / warp / int8-MMA have different
+            // accumulation orders, tolerance-tested at 1e-3) - the same
+            // documented drift class as tiers and the grouped MoE, and
+            // identical to what every chunked prefill already does.
+            // PULSAR_NO_DEEP_BATCH=1 restores single-token stepping.
+            let t = if std::env::var_os("PULSAR_NO_DEEP_BATCH").is_some()
                 && (pos + t as u32) / 4 > s.n_idx_topk
             {
                 1
