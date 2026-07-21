@@ -346,8 +346,27 @@ async function streamAssistant() {
   scrollDown();
 
   let acc = "";
-  let t0 = performance.now();
   let ntok = 0;
+  let t0 = 0; // decode timer starts at first token, not at fetch (matches pulsar-cli)
+  // Repaint throttle: rebuilding innerHTML per token is O(n²) and pins the
+  // main thread, so the ReadableStream reader stops draining, TCP backpressure
+  // fills the kernel send buffer, and the server's per-token write blocks —
+  // which stalls the decode loop and tanks tok/s. One render per frame is
+  // enough for smooth streaming and keeps the socket drained.
+  let rafGen = 0;
+  let rafPending = false;
+  const scheduleRender = () => {
+    if (rafPending) return;
+    rafPending = true;
+    const gen = rafGen;
+    requestAnimationFrame(() => {
+      rafPending = false;
+      if (gen !== rafGen) return; // superseded by a finalize / abort / error
+      body.innerHTML = renderMarkdown(acc) + '<span class="cursor"></span>';
+      scrollDown();
+    });
+  };
+  const cancelRender = () => { rafGen++; rafPending = false; };
 
   try {
     const resp = await fetch("/v1/chat/completions", {
@@ -380,24 +399,27 @@ async function streamAssistant() {
         try { ev = JSON.parse(payload); } catch { continue; }
         const delta = ev?.choices?.[0]?.delta;
         if (delta?.content) {
+          if (ntok === 0) t0 = performance.now();
           acc += delta.content;
           ntok += 1;
-          body.innerHTML = renderMarkdown(acc) + '<span class="cursor"></span>';
-          scrollDown();
+          scheduleRender();
         }
       }
     }
+    cancelRender();
     body.innerHTML = renderMarkdown(acc) || "<p><i>(empty)</i></p>";
     conversation.push({ role: "assistant", content: acc });
-    const dt = ((performance.now() - t0) / 1000).toFixed(1);
-    const rate = ntok && dt > 0 ? (ntok / dt).toFixed(1) : "—";
-    setStatus(`done · ${ntok} tok · ${dt}s · ${rate} tok/s`, "");
+    const dtNum = t0 ? (performance.now() - t0) / 1000 : 0;
+    const rate = ntok && dtNum > 0 ? (ntok / dtNum).toFixed(1) : "—";
+    setStatus(`done · ${ntok} tok · ${dtNum.toFixed(1)}s · ${rate} tok/s`, "");
   } catch (err) {
     if (err.name === "AbortError") {
+      cancelRender();
       body.innerHTML = renderMarkdown(acc) + '<p><i>(stopped)</i></p>';
       if (acc) conversation.push({ role: "assistant", content: acc });
       setStatus("stopped");
     } else {
+      cancelRender();
       body.innerHTML = '<p style="color:var(--danger)">error: ' + escapeHtml(err.message) + "</p>";
       setStatus("error", "err");
     }
