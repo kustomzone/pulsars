@@ -231,7 +231,16 @@ function scrollDown() {
 }
 
 function escapeHtml(s) {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  // Quotes must be escaped too: renderMarkdown drops matched URLs into an
+  // href="..." attribute, so an unescaped " in model output could break
+  // out of the attribute and inject an event handler (XSS). The URL regex
+  // already hard-anchors on https?://, so the scheme stays safe.
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 // Minimal markdown: fenced code blocks, inline code, bold, links, paragraphs.
