@@ -1466,7 +1466,7 @@ function applyStats(j) {
     ? gb(hw.ram_total_kb) + " GB (" + gb(hw.ram_available_kb || 0) + " free)"
     : "—";
   $("hw-cores").textContent = Number.isFinite(hw.cores) ? String(hw.cores) : "—";
-  if (j?.model && modelEl.textContent !== j.model) {
+  if (j?.model) {
     modelEl.textContent = j.model;
     modelSideEl.textContent = j.model;
   }
