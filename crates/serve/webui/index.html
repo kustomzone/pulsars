@@ -1579,7 +1579,6 @@ function applyTheme(theme, persist = true) {
   const dark = theme === "dark";
   document.documentElement.dataset.theme = dark ? "dark" : "light";
   themeBtn.querySelector(".theme-icon").textContent = dark ? "☀" : "☾";
-  themeBtn.querySelector(".theme-label").textContent = dark ? "Light" : "Dark";
   themeBtn.setAttribute("aria-label", dark ? "Switch to light mode" : "Switch to dark mode");
   themeBtn.setAttribute("aria-pressed", String(dark));
   themeBtn.title = dark ? "Switch to light mode" : "Switch to dark mode";
