@@ -896,6 +896,32 @@ mod real {
         }
     }
 
+    /// One resident expert tier's placement + routing hits, for the /stats
+    /// telemetry endpoint (the web UI's RAM/VRAM/Disk bars and per-tier heat).
+    pub struct TierStat {
+        pub dev: i32,
+        pub bytes: usize,
+        pub hits: u64,
+    }
+
+    /// Engine-side telemetry snapshot. Cumulative counters/timers; serve diffs
+    /// consecutive snapshots to get per-turn deltas. Hardware (RAM/cores) and
+    /// layer/expert counts are added serve-side from std + gguf metadata.
+    pub struct Stats {
+        pub gpu_count: i32,
+        pub ctx: u32,
+        pub tiers: Vec<TierStat>,
+        pub cpu_hits: u64,
+        pub cache_hits: u64,
+        /// cumulative per-stage wall time, seconds (see Prof)
+        pub prof_gpu_wait: f64,
+        pub prof_resolve: f64,
+        pub prof_h2d: f64,
+        pub prof_cpu: f64,
+        pub prof_tail: f64,
+        pub prof_calls: u64,
+    }
+
     /// Ping-pong staging arena for one parity of MLA layers: layer N+1's
     /// PINNED attn tensors are cudaMemcpyAsync'd here (2x the bandwidth of
     /// zero-copy kernel reads, and overlapped under layer N's compute).
@@ -3775,6 +3801,34 @@ mod real {
 
         pub fn ctx(&self) -> u32 {
             self.ctx
+        }
+
+        /// Telemetry snapshot for the /stats endpoint. Cheap: reads counters
+        /// and the resident tier list, no device work.
+        pub fn stats(&self) -> Stats {
+            let tiers = self
+                .tiers
+                .iter()
+                .map(|t| TierStat {
+                    dev: t.dev,
+                    bytes: t.pool.bytes(),
+                    hits: t.hits,
+                })
+                .collect();
+            let s = |d: std::time::Duration| d.as_secs_f64();
+            Stats {
+                gpu_count: kernels::device_count(),
+                ctx: self.ctx,
+                tiers,
+                cpu_hits: self.cpu_hits,
+                cache_hits: self.dev_cache.hits,
+                prof_gpu_wait: s(self.prof.sync),
+                prof_resolve: s(self.prof.resolve),
+                prof_h2d: s(self.prof.h2d),
+                prof_cpu: s(self.prof.cpu),
+                prof_tail: s(self.prof.tail),
+                prof_calls: self.prof.calls,
+            }
         }
 
         /// Persist the slab popularity census so the next run starts warm.

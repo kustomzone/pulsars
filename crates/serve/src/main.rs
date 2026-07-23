@@ -150,6 +150,48 @@ fn run() -> engine::Result {
                     });
                     respond_json(&mut stream, 200, &json)
                 }
+                // Telemetry for the web dashboard (Runtime/tier bars, timing
+                // breakdown, Brain heat). Cumulative counters; the UI diffs
+                // successive snapshots for per-turn deltas.
+                ("GET", "/stats") => {
+                    let s = st.stats();
+                    let meta = &model.gguf.metadata;
+                    let find_u = |suf: &str| {
+                        meta.iter()
+                            .find(|(k, _)| k.ends_with(suf))
+                            .and_then(|(_, v)| v.as_u64())
+                    };
+                    let tiers: Vec<_> = s
+                        .tiers
+                        .iter()
+                        .map(|t| serde_json::json!({"dev": t.dev, "bytes": t.bytes, "hits": t.hits}))
+                        .collect();
+                    let json = serde_json::json!({
+                        "model": model_name,
+                        "ctx": s.ctx,
+                        "n_layer": find_u(".block_count").unwrap_or(0),
+                        "n_expert": find_u(".expert_count").unwrap_or(0),
+                        "n_expert_used": find_u(".expert_used_count").unwrap_or(0),
+                        "hardware": {
+                            "gpu_count": s.gpu_count,
+                            "cores": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+                            "ram_total_kb": meminfo_kb("MemTotal"),
+                            "ram_available_kb": meminfo_kb("MemAvailable"),
+                        },
+                        "tiers": tiers,
+                        "cpu_hits": s.cpu_hits,
+                        "cache_hits": s.cache_hits,
+                        "prof": {
+                            "gpu_wait": s.prof_gpu_wait,
+                            "resolve": s.prof_resolve,
+                            "h2d": s.prof_h2d,
+                            "cpu": s.prof_cpu,
+                            "tail": s.prof_tail,
+                            "calls": s.prof_calls,
+                        },
+                    });
+                    respond_json(&mut stream, 200, &json)
+                }
                 ("POST", "/v1/chat/completions") => handle_chat(
                     &mut stream,
                     &body,
@@ -211,6 +253,20 @@ fn respond_json(
         body.len()
     )?;
     Ok(())
+}
+
+/// A /proc/meminfo field in kB (0 if unavailable, e.g. non-Linux). Used by
+/// the /stats hardware panel.
+fn meminfo_kb(key: &str) -> u64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with(key))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(0)
 }
 
 /// Raw bytes response with an explicit content-type (static assets, etc).
